@@ -95,12 +95,12 @@ revisions `lattice-rs/platform-revisions.json` pins).
   `877ce7a`, `09220e5`): the node's push became one node-wide stream of the
   template digest, `GET /mining/events`, before the Swift coordinator
   consumed it (`ae654df` left the consumer for later). The miner follows it:
-  a pushed digest other than the work's ends the batch as stale; a
+  a pushed digest other than the work's stops the batch's search as stale; a
   reconnect's first push is compared at once; a dropped stream ends nothing
   (the search on pushed work goes on and `GET /status` is polled meanwhile);
   resubscribing waits 250 ms doubling to 5 s, reset by a push. Each batch
-  still makes the one immediate `GET /status` probe and the pre-submit check
-  the Swift coordinator makes.
+  still makes the one immediate `GET /status` probe the Swift coordinator
+  makes.
 - Bearer tokens (lattice-node PR #67, `MiningCoordinator.swift`): a token
   file for a node's remote operator listener, read again per request like the
   cookie. Plain HTTP is allowed, as that listener serves it.
@@ -113,8 +113,7 @@ revisions `lattice-rs/platform-revisions.json` pins).
   (with its nonce cursor) lives across rounds while its settings do.
 - Shutdown (new): SIGINT/SIGTERM cancels the round, but a submission
   already in flight is still answered, for at most 10 s (`SUBMIT_GRACE`), so
-  a found block is not dropped; a found nonce is submitted without the
-  pre-submit staleness probe once cancelled.
+  a found block is not dropped.
 - Recipients (new): the effective recipient map is logged at start and on
   every change, with a warning when it is empty or a fetched template mines a
   chain it does not name (that chain's reward and fees burn), once per
@@ -132,6 +131,16 @@ exhausted result with a nonce; stdout is bounded in memory and stderr drained
 to a 4-KiB tail; Unix workers run in their own process group, torn down on
 cancellation; HTTP has byte bounds, deadlines and no redirects; worker count
 is capped at 1024.
+
+From Swift (deliberate): a found nonce is always submitted. Swift probes
+`GET /status` before a submission and between its retries, and drops the
+nonce when the tip has moved; here neither probe exists, and a search
+stopped because the work went stale still submits what it had found. Lattice
+state is immutable, so a block solved on an old tip is a valid side block
+whose work counts toward its subtree. The differential's `stale_retry` cycle
+asserts this instead of Swift's transcript. A node that forgot the work
+answers `unknownWork`: an ordinary non-accepted outcome, not a refusal, so the
+next round starts at once.
 
 New: the one-batch CLI (`--once`, `--no-stale-probe`, flags per setting) is
 replaced by `lattice-miner run` and `miner.json`. A round that gets no

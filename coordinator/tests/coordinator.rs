@@ -71,6 +71,11 @@ impl NodeClient for Node {
                     disposition: "refused".into(),
                     tip_cid: None,
                 }),
+                5 => Ok(Submission {
+                    accepted: false,
+                    disposition: "unknownWork".into(),
+                    tip_cid: None,
+                }),
                 _ => Ok(Submission {
                     accepted: true,
                     disposition: "accepted".into(),
@@ -167,7 +172,7 @@ async fn retry_same_nonce_and_clean_refusal() {
     }
 }
 #[tokio::test]
-async fn retries_bounded_and_stale_between_attempts() {
+async fn retries_bounded_and_a_moved_tip_ends_none() {
     let n = Arc::new(Node::new(work()));
     *n.answers.lock().unwrap() = VecDeque::from([1, 1, 1, 1, 1]);
     let mut c = Coordinator::new(n.clone(), vec![Arc::new(Searcher::default())], opts());
@@ -176,15 +181,52 @@ async fn retries_bounded_and_stale_between_attempts() {
     );
     assert_eq!(n.submits.lock().unwrap().len(), 4);
     assert_eq!(c.metrics().retry_backoff_count, 3);
+    // The tip moved between attempts: the found nonce is still a valid
+    // block, so the retry goes on.
     let n = Arc::new(Node::new(work()));
     n.answers.lock().unwrap().push_back(1);
     n.tokens.lock().unwrap().push_back(1);
     let mut c = Coordinator::new(n.clone(), vec![Arc::new(Searcher::default())], opts());
     assert!(matches!(
         c.run_batch(&CancellationToken::new()).await,
-        Cycle::Stale { .. }
+        Cycle::Submitted { submission, .. } if submission.accepted
+    ));
+    assert_eq!(n.submits.lock().unwrap().len(), 2);
+    assert_eq!(c.metrics().stale_abort_count, 0);
+}
+#[tokio::test]
+async fn a_solution_found_after_the_tip_moved_is_submitted() {
+    let n = Arc::new(Node::new(work()));
+    // Fresh at the batch's first probe; every later read names another tip.
+    *n.tokens.lock().unwrap() = VecDeque::from([0, 1, 1, 1]);
+    let mut c = Coordinator::new(
+        n.clone(),
+        vec![Arc::new(Searcher {
+            delay: Duration::from_millis(50),
+            ..Default::default()
+        })],
+        CoordinatorOptions {
+            stale_probe: true,
+            probe_interval: Duration::from_secs(3600),
+            ..opts()
+        },
+    );
+    assert!(matches!(
+        c.run_batch(&CancellationToken::new()).await,
+        Cycle::Submitted { submission, .. } if submission.accepted
+    ));
+    assert_eq!(*n.submits.lock().unwrap(), vec![("one".to_string(), 0)]);
+    // The node forgot the work: an ordinary answer, counted, not retried.
+    let n = Arc::new(Node::new(work()));
+    n.answers.lock().unwrap().push_back(5);
+    let mut c = Coordinator::new(n.clone(), vec![Arc::new(Searcher::default())], opts());
+    assert!(matches!(
+        c.run_batch(&CancellationToken::new()).await,
+        Cycle::Submitted { submission, .. }
+            if !submission.accepted && submission.disposition == "unknownWork"
     ));
     assert_eq!(n.submits.lock().unwrap().len(), 1);
+    assert_eq!(c.metrics().rejected_solution_count, 1);
 }
 #[tokio::test]
 async fn child_only_resumes_same_range_harder() {
@@ -292,7 +334,7 @@ async fn stale_failures_and_wrong_identity() {
     }
 }
 #[tokio::test]
-async fn repeat_probe_and_pre_submit_probe() {
+async fn repeat_probe_ends_the_search() {
     let n = Arc::new(Node::new(work()));
     *n.tokens.lock().unwrap() = VecDeque::from([0, 1]);
     let mut c = Coordinator::new(
@@ -412,6 +454,18 @@ async fn actual_swift_core_and_cycle_differential() {
             wrong: mode == "wrong_id",
             ..Default::default()
         });
+        if mode == "stale_retry" {
+            // A deliberate difference from Swift, which drops a found nonce
+            // when the tip moves between attempts: it is a valid block, so
+            // the retry is made.
+            let mut c = Coordinator::new(n.clone(), vec![worker], opts());
+            assert!(matches!(
+                c.run_batch(&CancellationToken::new()).await,
+                Cycle::Submitted { submission, .. } if submission.accepted
+            ));
+            assert_eq!(n.submits.lock().unwrap().len(), 2);
+            continue;
+        }
         let mut c = Coordinator::new(
             n.clone(),
             vec![worker.clone()],
