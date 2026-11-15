@@ -68,46 +68,78 @@ EOF
 
 # The miner's own settings, rewritten every boot like lattice.json. It reads
 # them again before every round; the node never sees them.
-recipients_json="$(printf '%s' "$RECIPIENTS" | jq -R 'split(",") | map(select(length > 0) | split("=") | {(.[0]): (.[1:] | join("="))}) | add // {}')"
+# A chain named twice is refused, not resolved to whichever entry came last.
+recipients_json="$(printf '%s' "$RECIPIENTS" | jq -R 'split(",") | map(select(length > 0) | split("=") | {key: .[0], value: (.[1:] | join("="))})
+    | if (map(.key) | length) != (map(.key) | unique | length) then error("RECIPIENTS names a chain twice") else from_entries end')" \
+    || { echo "RECIPIENTS refused: $RECIPIENTS" >&2; exit 2; }
 jq -n \
     --argjson recipients "$recipients_json" \
     --argjson workers "$WORKERS" \
     --argjson batch "$BATCH_SIZE" \
     '{worker: "/usr/local/bin/lattice-miner-gpu", workers: $workers, batchSize: $batch, recipients: $recipients}' \
     > "$ROOT/miner.json"
+# Fail fast, before syncing anything: settings the miner would refuse would
+# otherwise leave a rented GPU idle behind a healthy-looking node.
+lattice-miner check --config "$ROOT/miner.json"
 # The worker reads its backend from the environment the miner passes on.
 export LATTICE_MINER_BACKEND="${MINER_BACKEND:-cuda}"
 
-# Bring-up runs beside the foreground node: wait for the parent to catch up
-# to the network, then start the miner.
+# The node and the miner run side by side, and the container lives exactly as
+# long as both: when either exits the other is stopped and the container ends
+# with that status, so the host's restart policy (Docker, vast.ai) applies
+# instead of a miner that died while the node kept the container up.
+lattice up --root "$ROOT" --foreground &
+node_pid=$!
+miner_pid=""
+stopping=""
+trap 'stopping=1; kill -TERM "$node_pid" $miner_pid 2>/dev/null' TERM INT
+
+# Synced means CAUGHT UP TO THE NETWORK, not locally stable: a just-booted
+# node sits at height 0 with connected peers for longer than any local
+# stability window while cold sync spins up, and mining then extends a
+# private fork from genesis. Gate on the height a public reference node
+# reports (any backbone; tried in order) — never on local quiescence.
 # Hosted children catch up in the background; they never block Nexus mining.
-(
-    # Synced means CAUGHT UP TO THE NETWORK, not locally stable: a just-booted
-    # node sits at height 0 with connected peers for longer than any local
-    # stability window while cold sync spins up, and mining then extends a
-    # private fork from genesis. Gate on the height a public reference node
-    # reports (any backbone; tried in order) — never on local quiescence.
-    echo "mining bring-up: waiting for Nexus to catch up to the network…"
+echo "mining bring-up: waiting for Nexus to catch up to the network…"
+while :; do
     sleep 10
-    while :; do
-        network_height=""
-        for ref in ${REFERENCE_RPCS:-https://lattice-mainnet-iad.fly.dev https://lattice-mainnet-ams.fly.dev https://lattice-mainnet-sjc.fly.dev}; do
-            network_height="$(curl -fsS --max-time 8 "$ref/api/chain/info" 2>/dev/null | jq -r '.height // empty')" && [ -n "$network_height" ] && break
-        done
-        [ -n "$network_height" ] || { sleep 10; continue; }
-        height="$(rpc /api/chain/info 2>/dev/null | jq -r '.height // -1')"
-        peers="$(rpc /api/peers 2>/dev/null | jq -r '.count // 0' 2>/dev/null)"
-        if [ "${peers:-0}" -ge 1 ] && [ "${height:--1}" -ge "$network_height" ]; then
-            break
-        fi
-        echo "mining bring-up: local $height / network $network_height…"
-        sleep 10
+    [ -z "$stopping" ] || { wait "$node_pid" || true; exit 0; }
+    kill -0 "$node_pid" 2>/dev/null || { wait "$node_pid" || exit $?; exit 1; }
+    network_height=""
+    for ref in ${REFERENCE_RPCS:-https://lattice-mainnet-iad.fly.dev https://lattice-mainnet-ams.fly.dev https://lattice-mainnet-sjc.fly.dev}; do
+        network_height="$(curl -fsS --max-time 8 "$ref/api/chain/info" 2>/dev/null | jq -r '.height // empty')" && [ -n "$network_height" ] && break
     done
-    echo "mining bring-up: Nexus caught up (height $height, network $network_height)."
+    [ -n "$network_height" ] || continue
+    height="$(rpc /api/chain/info 2>/dev/null | jq -r '.height // -1')" || height=-1
+    peers="$(rpc /api/peers 2>/dev/null | jq -r '.count // 0' 2>/dev/null)" || peers=0
+    if [ "${peers:-0}" -ge 1 ] && [ "${height:--1}" -ge "$network_height" ]; then
+        break
+    fi
+    echo "mining bring-up: local $height / network $network_height…"
+done
+echo "mining bring-up: Nexus caught up (height $height, network $network_height)."
 
-    echo "mining bring-up: starting lattice-miner (log $ROOT/mining.log)."
-    exec lattice-miner run --node "$NEXUS_RPC" --cookie-file "$COOKIE_FILE" \
-        --config "$ROOT/miner.json" >> "$ROOT/mining.log" 2>&1
-) &
+echo "mining bring-up: starting lattice-miner (log $ROOT/mining.log)."
+lattice-miner run --node "$NEXUS_RPC" --cookie-file "$COOKIE_FILE" \
+    --config "$ROOT/miner.json" >> "$ROOT/mining.log" 2>&1 &
+miner_pid=$!
 
-exec lattice up --root "$ROOT" --foreground
+while kill -0 "$node_pid" 2>/dev/null && kill -0 "$miner_pid" 2>/dev/null; do
+    sleep 5
+done
+status=0
+if [ -n "$stopping" ]; then
+    echo "stopping: the node and lattice-miner were asked to exit." >&2
+elif kill -0 "$node_pid" 2>/dev/null; then
+    wait "$miner_pid" || status=$?
+    echo "lattice-miner exited (status $status); stopping the node. Last of $ROOT/mining.log:" >&2
+    tail -n 20 "$ROOT/mining.log" >&2 || true
+    [ "$status" -ne 0 ] || status=1
+else
+    wait "$node_pid" || status=$?
+    echo "the node exited (status $status); stopping lattice-miner." >&2
+fi
+kill -TERM "$node_pid" "$miner_pid" 2>/dev/null || true
+wait "$node_pid" 2>/dev/null || true
+wait "$miner_pid" 2>/dev/null || true
+exit "$status"

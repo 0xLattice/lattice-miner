@@ -87,7 +87,7 @@ async fn node(
                     };
                     (
                         200,
-                        serde_json::json!({"workID":format!("work-{n}"),"block":block,"searchTarget":"0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","targets":["0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"],"chainPath":["Nexus"],"expiresInMilliseconds":30000,"templateDigest":format!("digest-{n}")}),
+                        serde_json::json!({"workID":format!("work-{n}"),"block":block,"searchTarget":"0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","targets":["0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"],"chainPath":["Nexus"],"chains":[{"chainPath":["Nexus"],"rewardRecipient":"first"},{"chainPath":["Nexus","Kid"]}],"expiresInMilliseconds":30000,"templateDigest":format!("digest-{n}")}),
                     )
                 } else if head.starts_with("POST /mining/work ") {
                     (
@@ -191,6 +191,15 @@ async fn run_rereads_settings_each_round_and_keeps_the_last_good() {
     assert!(output.status.success());
     let log = String::from_utf8_lossy(&output.stdout);
     assert!(log.contains("accepted tip=fixture-tip"), "{log}");
+    assert!(log.contains("recipients: Nexus=first\n"), "{log}");
+    assert!(log.contains("recipients: Nexus=second\n"), "{log}");
+    assert_eq!(log.matches("recipients: Nexus=second").count(), 1, "{log}");
+    // Said once, not every round.
+    assert_eq!(
+        log.matches("mines Nexus/Kid with no recipient").count(),
+        1,
+        "{log}"
+    );
     assert!(
         log.contains("mining on with the settings read before"),
         "{log}"
@@ -223,4 +232,23 @@ fn run_refuses_a_bad_first_settings_file_and_needs_credentials() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("recipients"));
     assert!(!run(&[]).status.success());
+}
+
+#[test]
+fn check_answers_whether_run_would_accept_the_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("miner.json");
+    let check = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_lattice-miner"))
+            .args(["check", "--config"])
+            .arg(&config)
+            .output()
+            .unwrap()
+    };
+    std::fs::write(&config, r#"{"recipients":{"Nexus":"a"}}"#).unwrap();
+    assert!(check().status.success());
+    std::fs::write(&config, r#"{"recipients":{"Nexus":"a","Nexus":"b"}}"#).unwrap();
+    let output = check();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Nexus is named twice"));
 }

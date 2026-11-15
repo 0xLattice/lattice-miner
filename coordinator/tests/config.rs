@@ -24,6 +24,12 @@ fn settings_are_checked_and_unknown_keys_refused() {
         })
     );
     assert_eq!(config.template_timeout(), Duration::from_secs(30));
+    assert!(
+        parse(r#"{"recipients":null}"#)
+            .unwrap()
+            .recipients
+            .is_none()
+    );
     let defaults = parse("{}").unwrap();
     assert_eq!(defaults.workers(), 1);
     assert_eq!(defaults.batch_size(), 2_000_000_000);
@@ -43,6 +49,8 @@ fn settings_are_checked_and_unknown_keys_refused() {
         r#"{"templateTimeoutSeconds":61}"#,
         r#"{"roundDeadlineMultiplier":0}"#,
         r#"{"worker":"/nonexistent/worker"}"#,
+        r#"{"recipients":{"Nexus":"a","Nexus":"b"}}"#,
+        r#"{"minWork":{"Nexus":"2^8","Nexus":"2^9"}}"#,
     ] {
         assert!(parse(bad).is_err(), "{bad}");
     }

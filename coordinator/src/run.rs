@@ -6,6 +6,7 @@
 //! longer checks is reported and the settings read before are kept.
 use crate::*;
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -26,6 +27,21 @@ pub struct RunOptions {
 
 fn log(message: impl AsRef<str>) {
     println!("{}", message.as_ref());
+}
+
+/// The recipients in effect, said whenever they change. None at all is loud:
+/// every block then pays no one.
+fn log_recipients(recipients: &Option<BTreeMap<String, String>>) {
+    match recipients.as_ref().filter(|r| !r.is_empty()) {
+        None => log("WARNING: miner.json names no recipients: every block's reward and fees burn"),
+        Some(r) => log(format!(
+            "recipients: {}",
+            r.iter()
+                .map(|(chain, address)| format!("{chain}={address}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
 }
 
 /// The workers a configuration names.
@@ -69,10 +85,16 @@ pub async fn run(options: RunOptions, cancel: CancellationToken) -> Result<(), S
     let mut built: Option<(MinerConfig, HttpNodeClient, Coordinator)> = None;
     let mut longest_completed = Duration::ZERO;
     let mut without_template_since: Option<Instant> = None;
+    let mut logged_recipients = None;
+    let mut warned_unpaid: Vec<String> = vec![];
     while !cancel.is_cancelled() {
         match MinerConfig::load(&options.config) {
             Ok(read) => config = read,
             Err(e) => log(format!("mining on with the settings read before: {e}")),
+        }
+        if logged_recipients.as_ref() != Some(&config.recipients) {
+            log_recipients(&config.recipients);
+            logged_recipients = Some(config.recipients.clone());
         }
         let stale = built.as_ref().is_none_or(|(was, _, _)| {
             (
@@ -88,7 +110,18 @@ pub async fn run(options: RunOptions, cancel: CancellationToken) -> Result<(), S
             )
         });
         if stale {
-            let node = client(&config)?;
+            let node = match client(&config) {
+                Ok(node) => node,
+                Err(e) => {
+                    log(format!(
+                        "cannot reach the node with these settings ({e}); retrying"
+                    ));
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = tokio::time::sleep(RETRY_WAIT) => continue,
+                    }
+                }
+            };
             let coordinator = Coordinator::new(
                 Arc::new(node.clone()),
                 workers(&config),
@@ -118,6 +151,16 @@ pub async fn run(options: RunOptions, cancel: CancellationToken) -> Result<(), S
             }
         };
         let elapsed = started.elapsed();
+        let unpaid = node.unpaid_chains();
+        if unpaid != warned_unpaid {
+            if !unpaid.is_empty() {
+                log(format!(
+                    "WARNING: the node's template mines {} with no recipient in miner.json: their rewards and fees burn",
+                    unpaid.join(", ")
+                ));
+            }
+            warned_unpaid = unpaid;
+        }
         if !matches!(cycle, Cycle::Backoff { .. }) {
             without_template_since = None;
         }

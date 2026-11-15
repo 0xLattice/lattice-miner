@@ -11,6 +11,8 @@ pub enum Error {
     Unauthorized(u16),
     #[error("invalid node response: HTTP {0}")]
     Response(u16),
+    #[error("the node answered HTTP {0}: {1}")]
+    Refused(u16, String),
     #[error("HTTP request: {0}")]
     Http(#[from] reqwest::Error),
     #[error("invalid JSON: {0}")]
@@ -76,6 +78,25 @@ pub struct TemplateResponse {
     pub targets: Vec<lattice_primitives::UInt256>,
     pub chain_path: Vec<String>,
     pub template_digest: String,
+    /// Every chain the template's block commits, with the recipient each pays.
+    #[serde(default)]
+    pub chains: Vec<TemplateChain>,
+}
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateChain {
+    pub chain_path: Vec<String>,
+    pub reward_recipient: Option<String>,
+}
+impl TemplateResponse {
+    /// The template's chains that pay no one: their reward and fees burn.
+    pub fn unpaid_chains(&self) -> Vec<String> {
+        self.chains
+            .iter()
+            .filter(|c| c.reward_recipient.as_deref().is_none_or(str::is_empty))
+            .map(|c| c.chain_path.join("/"))
+            .collect()
+    }
 }
 /// Immutable assignment data, constructed only after canonical block encoding.
 #[derive(Debug, Clone)]

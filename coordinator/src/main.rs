@@ -18,6 +18,12 @@ enum Command {
     /// minBlockIntervalSeconds, templateTimeoutSeconds,
     /// roundDeadlineMultiplier) is read again before every round.
     Run(RunArgs),
+    /// Check a settings file and exit: 0 if `run` would accept it, 2 with
+    /// the reason if not.
+    Check {
+        #[arg(long, default_value = "miner.json")]
+        config: PathBuf,
+    },
 }
 
 #[derive(Args)]
@@ -42,7 +48,19 @@ struct RunArgs {
 
 #[tokio::main]
 async fn main() {
-    let Command::Run(args) = Cli::parse().command;
+    let args = match Cli::parse().command {
+        Command::Run(args) => args,
+        Command::Check { config } => match MinerConfig::load(&config) {
+            Ok(_) => {
+                println!("{}: ok", config.display());
+                return;
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+        },
+    };
     let cancel = CancellationToken::new();
     let stop = cancel.clone();
     tokio::spawn(async move {

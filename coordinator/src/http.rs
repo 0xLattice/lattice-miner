@@ -60,6 +60,7 @@ pub struct HttpNodeClient {
     client: reqwest::Client,
     timeout: Duration,
     maximum_bytes: usize,
+    unpaid: Arc<RwLock<Vec<String>>>,
 }
 
 impl HttpNodeClient {
@@ -106,7 +107,14 @@ impl HttpNodeClient {
                 .build()?,
             timeout,
             maximum_bytes,
+            unpaid: Arc::default(),
         })
+    }
+
+    /// The chains the last fetched template pays no one (see
+    /// [`TemplateResponse::unpaid_chains`]).
+    pub fn unpaid_chains(&self) -> Vec<String> {
+        self.unpaid.read().unwrap().clone()
     }
 
     /// The body of the next template requests: recipients and minimum work.
@@ -266,6 +274,21 @@ impl HttpNodeClient {
     }
 }
 
+/// The reason in a node's `{"error":{"message":...}}` refusal body.
+fn refusal_message(bytes: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Refusal {
+        error: Reason,
+    }
+    #[derive(serde::Deserialize)]
+    struct Reason {
+        message: String,
+    }
+    serde_json::from_slice::<Refusal>(bytes)
+        .ok()
+        .map(|r| r.error.message)
+}
+
 pub fn decode_submission(status: u16, bytes: &[u8]) -> Result<Submission, Error> {
     if status == 401 || status == 403 {
         return Err(Error::Unauthorized(status));
@@ -276,22 +299,14 @@ pub fn decode_submission(status: u16, bytes: &[u8]) -> Result<Submission, Error>
     if let Ok(result) = serde_json::from_slice::<Submission>(bytes) {
         return Ok(result);
     }
-    if status >= 400 {
-        #[derive(serde::Deserialize)]
-        struct Refusal {
-            error: Reason,
-        }
-        #[derive(serde::Deserialize)]
-        struct Reason {
-            message: String,
-        }
-        if let Ok(r) = serde_json::from_slice::<Refusal>(bytes) {
-            return Ok(Submission {
-                accepted: false,
-                disposition: r.error.message,
-                tip_cid: None,
-            });
-        }
+    if status >= 400
+        && let Some(message) = refusal_message(bytes)
+    {
+        return Ok(Submission {
+            accepted: false,
+            disposition: message,
+            tip_cid: None,
+        });
     }
     Err(Error::Response(status))
 }
@@ -301,11 +316,16 @@ impl NodeClient for HttpNodeClient {
         async move {
             let request = self.request.read().unwrap().clone();
             let (status, bytes) = self.request("mining/templates", Some(request)).await?;
-            match status {
-                409 | 503 => Ok(None),
-                200 => Ok(Some(
-                    serde_json::from_slice::<TemplateResponse>(&bytes)?.try_into()?,
-                )),
+            if status == 200 {
+                let template = serde_json::from_slice::<TemplateResponse>(&bytes)?;
+                *self.unpaid.write().unwrap() = template.unpaid_chains();
+                return Ok(Some(template.try_into()?));
+            }
+            // The node's own reason, when it gives one, says why there is
+            // no template (not synced, a bad recipient, ...).
+            match (status, refusal_message(&bytes)) {
+                (_, Some(message)) => Err(Error::Refused(status, message)),
+                (409 | 503, None) => Ok(None),
                 _ => Err(Error::Response(status)),
             }
         }

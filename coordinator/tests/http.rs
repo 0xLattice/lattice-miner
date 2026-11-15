@@ -68,6 +68,11 @@ async fn status_digest_fallback_and_template_refusal() {
         assert!(request.starts_with("POST /mining/templates "));
         assert!(request.ends_with(r#"{"recipients":[]}"#));
     }
+    // A refusal keeps the node's reason.
+    let (url, t) = server(503, r#"{"error":{"message":"not synced"}}"#.into()).await;
+    let error = client(&url).fetch_work().await.unwrap_err();
+    assert_eq!(error.to_string(), "the node answered HTTP 503: not synced");
+    t.await.unwrap();
 }
 #[tokio::test]
 async fn submit_contract_cookie_and_refusals() {

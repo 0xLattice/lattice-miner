@@ -83,7 +83,11 @@ work's. A dropped stream says nothing about the chain: the search goes on,
 `GET /status` is polled every 2 s meanwhile, and the stream is opened again
 after a wait doubling from 250 ms to 5 s. A round without a template, a refused
 submission or a failed worker is logged and retried after 5 s. SIGINT or
-SIGTERM ends the round in flight and exits.
+SIGTERM ends the round in flight and exits; a submission already in flight
+gets up to 10 s to be answered first. The recipients in effect are logged at
+start and whenever they change, with a warning when none are named or a
+template mines a chain with none. `lattice-miner check --config miner.json`
+exits 0 if `run` would accept the file and 2 with the reason if not.
 
 `coordinator/tools/node-integration.py` mines real blocks through a local
 lattice-node, including a child chain under a much harder parent; see
@@ -247,3 +251,9 @@ fees. No key or pre-signed reward file lives on the box. Other tunables via `-e`
 `HOSTED_CHAINS` (merge-mined child paths, parent first; default `Nexus/testnet`, empty
 = Nexus only), `NEXUS_PEERS`, `WORKERS`, `BATCH_SIZE`, `MINER_BACKEND`
 (cuda|opencl|cpu). See `deploy/gpu-entrypoint.sh`.
+
+Settings the miner would refuse (a chain named twice in `RECIPIENTS`, say) stop the
+container before the node starts. Once running, the container lives exactly as long
+as both the node and the miner: if either exits, the other is stopped and the
+container exits with that status, so a restart policy (`--restart unless-stopped`,
+or the rental host's) brings it back rather than leaving a node up with no miner.

@@ -94,6 +94,8 @@ impl Default for CoordinatorOptions {
         }
     }
 }
+/// How long a submission in flight at shutdown may still take.
+pub const SUBMIT_GRACE: Duration = Duration::from_secs(10);
 pub struct Coordinator {
     node: Arc<dyn NodeClient>,
     workers: Vec<Arc<dyn Worker>>,
@@ -137,8 +139,10 @@ impl Coordinator {
     pub fn metrics(&self) -> &Metrics {
         &self.metrics
     }
+    /// Whether the node has moved on from `work`. Cancellation proves nothing
+    /// either way: a found nonce is still submitted, within [`SUBMIT_GRACE`].
     async fn stale(&self, work: &Work, cancel: &CancellationToken) -> bool {
-        tokio::select! {biased;_=cancel.cancelled()=>true,result=self.node.stale_token()=>matches!(result,Ok(Some(token)) if token!=work.stale_token)}
+        tokio::select! {biased;_=cancel.cancelled()=>false,result=self.node.stale_token()=>matches!(result,Ok(Some(token)) if token!=work.stale_token)}
     }
     async fn submit_retry(
         &mut self,
@@ -148,7 +152,18 @@ impl Coordinator {
     ) -> Cycle {
         let mut attempt = 0;
         loop {
-            let answer = tokio::select! {biased;_=cancel.cancelled()=>return Cycle::Cancelled,r=self.node.submit(result.work_id.clone(),result.nonce)=>r};
+            // A found block is not dropped on shutdown: a submission in
+            // flight when `cancel` fires gets SUBMIT_GRACE to be answered.
+            let submit = self.node.submit(result.work_id.clone(), result.nonce);
+            tokio::pin!(submit);
+            let answer = tokio::select! {
+                biased;
+                answer = &mut submit => answer,
+                _ = cancel.cancelled() => match tokio::time::timeout(SUBMIT_GRACE, &mut submit).await {
+                    Ok(answer) => answer,
+                    Err(_) => return Cycle::Cancelled,
+                },
+            };
             match answer {
                 Ok(submission) => {
                     if submission.accepted {

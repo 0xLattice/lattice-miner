@@ -111,6 +111,16 @@ revisions `lattice-rs/platform-revisions.json` pins).
   `--once` child per round, so the probe that the node answers templates
   before a round is the round's own template request, and the coordinator
   (with its nonce cursor) lives across rounds while its settings do.
+- Shutdown (new): SIGINT/SIGTERM cancels the round, but a submission
+  already in flight is still answered, for at most 10 s (`SUBMIT_GRACE`), so
+  a found block is not dropped; a found nonce is submitted without the
+  pre-submit staleness probe once cancelled.
+- Recipients (new): the effective recipient map is logged at start and on
+  every change, with a warning when it is empty or a fetched template mines a
+  chain it does not name (that chain's reward and fees burn), once per
+  change. A chain named twice in `miner.json` is refused.
+- A template request the node refuses keeps the node's own reason
+  (`{"error":{"message":...}}`) in the log, as submissions already did.
 - The `lattice.json` `mine` fallback (`fcc7bee`, `83a5d9d`) is not ported:
   that file is the node's, and the miner reads only its own.
 

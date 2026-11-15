@@ -15,10 +15,13 @@ pub struct MinerConfig {
     /// Nonces per round, across all workers.
     pub batch_size: Option<u64>,
     /// Where each chain's block reward and fees go, by chain path. A chain
-    /// left out mines to no one: its reward and fees burn.
+    /// left out mines to no one: its reward and fees burn. A chain named
+    /// twice is refused, rather than one entry silently winning.
+    #[serde(default, deserialize_with = "unique_keys")]
     pub recipients: Option<BTreeMap<String, String>>,
     /// Minimum work per block by chain path (`2^N` or a decimal integer): a
     /// local search filter; blocks still commit their scheduled target.
+    #[serde(default, deserialize_with = "unique_keys")]
     pub min_work: Option<BTreeMap<String, String>>,
     /// Shortest gap between the starts of two rounds that produced parent
     /// blocks. A floor, never a ceiling: a round that already ran longer
@@ -141,6 +144,37 @@ impl MinerConfig {
         Duration::from_secs(measured.saturating_mul(multiplier).min(u64::MAX / 4))
             .max(FIRST_ROUND_ALLOWANCE)
     }
+}
+
+/// A JSON object whose keys are all distinct (serde_json otherwise keeps the
+/// last of a repeated key).
+fn unique_keys<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<BTreeMap<String, String>>, D::Error> {
+    struct Unique;
+    impl<'de> serde::de::Visitor<'de> for Unique {
+        type Value = Option<BTreeMap<String, String>>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an object of chain paths to strings, or null")
+        }
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut access: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut map = BTreeMap::new();
+            while let Some((key, value)) = access.next_entry::<String, String>()? {
+                if map.contains_key(&key) {
+                    return Err(serde::de::Error::custom(format!("{key} is named twice")));
+                }
+                map.insert(key, value);
+            }
+            Ok(Some(map))
+        }
+    }
+    deserializer.deserialize_any(Unique)
 }
 
 fn entries(map: &Option<BTreeMap<String, String>>) -> Vec<String> {
