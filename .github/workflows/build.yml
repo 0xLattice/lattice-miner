@@ -6,6 +6,19 @@ on:
   pull_request:
 
 jobs:
+  # The miner (coordinator, round loop) and the worker contract they share,
+  # including the differential test against the Swift coordinator's vectors.
+  miner:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt -p lattice-miner -p lattice-miner-core -- --check
+      - run: cargo clippy --locked -p lattice-miner -p lattice-miner-core --all-targets -- -D warnings
+      - run: cargo test --locked -p lattice-miner -p lattice-miner-core
+
   # Default build (Metal + CPU) and the golden-reference tests. Metal needs macOS;
   # the SHA-256 vector + meets_target tests are the oracle the GPU kernels mirror.
   macos:

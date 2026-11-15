@@ -1,0 +1,15 @@
+[package]
+name = "lattice-miner-core"
+version = "0.1.0"
+edition = "2021"
+description = "The Lattice mining worker contract: targets, nonce ranges and the worker result"
+license = "MIT"
+repository = "https://github.com/0xLattice/lattice-miner"
+publish = false
+
+[dependencies]
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

@@ -1,9 +1,102 @@
-# lattice-miner-gpu
+# lattice-miner
 
-A GPU proof-of-work mining worker for the [Lattice](https://github.com/0xLattice/lattice-node)
-network. It implements the **Mining Worker Protocol** — a coordinator
-(`lattice-mining-coordinator`) hands it a nonce range and the nonce-independent
-PoW prefix; it searches for a nonce where
+Mining for the [Lattice](https://github.com/0xLattice/lattice-node) network. A
+node serves block templates and accepts work; it runs no miner. Everything that
+mines lives here:
+
+| Crate | Binary | What it is |
+| --- | --- | --- |
+| [`coordinator/`](coordinator) | `lattice-miner` | The miner: a client of one node. It fetches templates, splits nonce ranges across workers, follows the node's template digest, submits what is found, and runs the rounds. |
+| `.` (root) | `lattice-miner-gpu` | The worker: CPU, Metal, CUDA and OpenCL nonce search. |
+| [`core/`](core) | | The worker contract both sides share: target spelling, nonce ranges, the worker's result. |
+
+## The miner
+
+```bash
+cargo build --release --workspace
+lattice-miner run --node http://10.0.0.5:8090 --token-file miner.token --config miner.json
+lattice-miner run --node http://127.0.0.1:8080 --cookie-file <root>/chains/Nexus/.cookie
+```
+
+`--node` is a node's remote operator listener with a bearer token
+(`--token-file`), or its loopback API with the cookie it writes at every start
+(`--cookie-file`). Either file is read again for every request. A token for
+mining needs `POST /mining/templates`, `POST /mining/work` and `GET /status`,
+and `GET /mining/events` to be pushed template changes rather than poll for
+them:
+
+```bash
+# Beside the node:
+lattice tokens create miner --out miner.token --root /var/lib/lattice \
+  --route "POST /mining/templates" --route "POST /mining/work" \
+  --route "GET /status" --route "GET /mining/events"
+```
+
+Its settings are its own file, never the node's (default `miner.json`):
+
+```json
+{
+  "worker": "/usr/local/bin/lattice-miner-gpu",
+  "workers": 1,
+  "batchSize": 2000000000,
+  "recipients": {
+    "Nexus": "<address>",
+    "Nexus/Alpha": "<address>"
+  },
+  "minWork": {"Nexus": "2^32"},
+  "minBlockIntervalSeconds": 10
+}
+```
+
+- `worker`: `cpu` (the built-in search, the default) or the path of any
+  executable implementing the worker contract, such as `lattice-miner-gpu`. Its
+  backend is chosen by `LATTICE_MINER_BACKEND` in the miner's environment.
+- `workers` (default 1) and `batchSize` (nonces per round across all workers,
+  default 2,000,000,000).
+- `recipients`: where each chain's block reward and fees go, by chain path.
+  Every template request carries them. A chain left out mines to no one: its
+  reward and fees burn.
+- `minWork`: per chain, `2^N` or a decimal integer. A local search filter: the
+  miner neither searches for nor submits hashes below it; blocks still commit
+  their scheduled target.
+- `minBlockIntervalSeconds`: a floor on the spacing of rounds that produce a
+  parent block, measured from the round's start; a slower round waits not at
+  all.
+- `templateTimeoutSeconds` (1 to 60, default 60): how long one request to the
+  node may take, a template request including the node building it.
+- `roundDeadlineMultiplier` (default 10): the round deadline is 600 s until a
+  round completes, then the longest completed round (counted at most 600 s)
+  times this, never less than 600 s. It only catches a hung round; work never
+  expires on a clock.
+
+An unknown key is refused (a misspelt `recipients` would burn every reward).
+The file is read again before every round: a changed recipient applies to the
+next round with no restart, and a file that no longer checks is logged while
+the last good settings are kept. Only a bad file at start is fatal.
+
+A round is one batch: fetch a template, search it, submit hits. A hit that
+clears only some of the template's targets (a child chain's, `childOnly`) is
+submitted and the search goes on over the same range toward the rest. Work is
+valid until the node's template digest changes: the miner follows
+`GET /mining/events` and ends a batch when a pushed digest differs from its
+work's. A dropped stream says nothing about the chain: the search goes on,
+`GET /status` is polled every 2 s meanwhile, and the stream is opened again
+after a wait doubling from 250 ms to 5 s. A round without a template, a refused
+submission or a failed worker is logged and retried after 5 s. SIGINT or
+SIGTERM ends the round in flight and exits; a submission already in flight
+gets up to 10 s to be answered first. The recipients in effect are logged at
+start and whenever they change, with a warning when none are named or a
+template mines a chain with none. `lattice-miner check --config miner.json`
+exits 0 if `run` would accept the file and 2 with the reason if not.
+
+`coordinator/tools/node-integration.py` mines real blocks through a local
+lattice-node, including a child chain under a much harder parent; see
+[PORTING.md](PORTING.md#evidence).
+
+## The worker
+
+The worker implements the **Mining Worker Protocol** — the miner hands it a
+nonce range and the nonce-independent PoW prefix; it searches for a nonce where
 
 ```
 SHA256( prefix || nonce_be64 )  ≤  target
@@ -53,7 +146,8 @@ cloud GPUs — essential for hashpower beyond Apple Silicon.
 ## Download
 
 Prebuilt workers are attached to each
-[release](https://github.com/0xLattice/lattice-miner-gpu/releases):
+[release](https://github.com/0xLattice/lattice-miner/releases); archives of
+releases after 0.1.0 also carry the miner (`lattice-miner`) in `bin/`:
 
 | Archive | Backends | Backend flag |
 | --- | --- | --- |
@@ -61,11 +155,7 @@ Prebuilt workers are attached to each
 | `lattice-miner-gpu-<version>-windows-amd64.tar.gz` | OpenCL, CUDA, CPU | `--backend opencl` (AMD / Intel / NVIDIA) or `--backend cuda` (NVIDIA) |
 | `lattice-miner-gpu-<version>-macos-arm64.tar.gz` | Metal, CPU | `--backend metal` (the default on macOS) |
 
-The Linux binary needs glibc 2.31 or newer (Ubuntu 20.04, Debian 11 and later).
-The mining coordinator (from the
-[lattice-node releases](https://github.com/0xLattice/lattice-node/releases)) is
-built for Linux and macOS only, so to mine on Windows run the Linux archive under
-WSL2; the Windows binary runs as a standalone worker.
+The Linux binaries need glibc 2.31 or newer (Ubuntu 20.04, Debian 11 and later).
 
 Verify the archive against its checksum file, then unpack it:
 
@@ -77,7 +167,7 @@ tar -xzf lattice-miner-gpu-<version>-<platform>.tar.gz
 ```
 
 On Linux and Windows, `auto` picks OpenCL. On an NVIDIA machine that mines with
-CUDA, run the coordinator with `LATTICE_MINER_BACKEND=cuda`. The worker loads its
+CUDA, run the miner with `LATTICE_MINER_BACKEND=cuda`. The worker loads its
 GPU libraries at run time:
 
 - OpenCL: `libOpenCL.so.1` on Linux (`ocl-icd-libopencl1` plus the graphics
@@ -120,7 +210,7 @@ lattice-miner-gpu ... --backend cuda
 ```
 
 Without `--backend` the worker uses the build's GPU backend for the platform:
-Metal on macOS, otherwise OpenCL, otherwise CUDA. A coordinator passes no
+Metal on macOS, otherwise OpenCL, otherwise CUDA. The miner passes no
 backend, so to force one set `LATTICE_MINER_BACKEND` in its environment. A
 backend that cannot search (no library, no device, a kernel that does not
 build) exits non-zero with the reason on stderr: the range is not reported as
@@ -136,21 +226,17 @@ cargo test --features opencl -- --ignored
 
 ## Use with a node
 
-Point the coordinator at this binary:
-
-```bash
-lattice-mining-coordinator \
-  --node http://127.0.0.1:8080 --rpc-cookie-file <root>/chains/Nexus/.cookie \
-  --recipient Nexus=<addr> \
-  --worker-executable ./target/release/lattice-miner-gpu --workers 1
-```
+Name the worker in the miner's `miner.json` (`"worker": "./target/release/lattice-miner-gpu"`)
+and run `lattice-miner run` as above.
 
 ## Docker (cloud GPU rental)
 
 A self-contained CUDA image (`ghcr.io/0xlattice/lattice-miner-gpu:main`, built by CI)
-bundles a Lattice node + the mining coordinator + this worker. One node process hosts
-Nexus and the configured child levels; once Nexus catches up to the network, the
-reference mine-supervisor drives the GPU:
+bundles a Lattice node (`lattice-node` and `lattice` from the node image), the miner and
+this worker. One node process hosts Nexus and the configured child levels; once Nexus
+catches up to the network, `lattice-miner run` mines through the node's loopback API with
+the CUDA worker, its settings written to `/data/miner.json` and its log to
+`/data/mining.log`:
 
 ```bash
 docker run --gpus all -v lattice-data:/data \
@@ -165,3 +251,9 @@ fees. No key or pre-signed reward file lives on the box. Other tunables via `-e`
 `HOSTED_CHAINS` (merge-mined child paths, parent first; default `Nexus/testnet`, empty
 = Nexus only), `NEXUS_PEERS`, `WORKERS`, `BATCH_SIZE`, `MINER_BACKEND`
 (cuda|opencl|cpu). See `deploy/gpu-entrypoint.sh`.
+
+Settings the miner would refuse (a chain named twice in `RECIPIENTS`, say) stop the
+container before the node starts. Once running, the container lives exactly as long
+as both the node and the miner: if either exits, the other is stopped and the
+container exits with that status, so a restart policy (`--restart unless-stopped`,
+or the rental host's) brings it back rather than leaving a node up with no miner.
