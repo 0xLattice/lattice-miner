@@ -1,120 +1,76 @@
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use lattice_miner::*;
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
+
+/// Mine Lattice through a node: templates in, nonces out.
 #[derive(Parser)]
-#[command(about = "Coordinate Lattice nonce workers against an operator-selected node")]
-struct Args {
+#[command(name = "lattice-miner", version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Mine in rounds until stopped (SIGINT or SIGTERM). The settings file
+    /// (worker, workers, batchSize, recipients, minWork,
+    /// minBlockIntervalSeconds, templateTimeoutSeconds,
+    /// roundDeadlineMultiplier) is read again before every round.
+    Run(RunArgs),
+}
+
+#[derive(Args)]
+#[command(group = clap::ArgGroup::new("auth").required(true))]
+struct RunArgs {
+    /// The node's URL: its loopback API (with --cookie-file) or its remote
+    /// operator listener (with --token-file).
     #[arg(long)]
     node: String,
-    #[arg(long)]
-    rpc_cookie_file: Option<PathBuf>,
-    #[arg(long, conflicts_with = "rpc_cookie_file")]
+    /// A bearer token file. The token needs POST /mining/templates,
+    /// POST /mining/work and GET /status, and GET /mining/events to be pushed
+    /// template changes instead of polling.
+    #[arg(long, group = "auth")]
     token_file: Option<PathBuf>,
-    #[arg(long)]
-    workers: Option<usize>,
-    #[arg(long)]
-    batch_size: Option<u64>,
-    #[arg(long)]
-    worker_executable: Option<PathBuf>,
-    #[arg(long, allow_hyphen_values = true)]
-    worker_arg: Vec<String>,
-    #[arg(long)]
-    recipient: Vec<String>,
-    #[arg(long)]
-    min_work: Vec<String>,
-    #[arg(long)]
-    once: bool,
-    #[arg(long)]
-    no_stale_probe: bool,
-    #[arg(long, default_value_t = 15000)]
-    request_timeout_ms: u64,
+    /// The node's loopback RPC cookie file.
+    #[arg(long, group = "auth")]
+    cookie_file: Option<PathBuf>,
+    /// The miner's settings.
+    #[arg(long, default_value = "miner.json")]
+    config: PathBuf,
 }
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let a = Args::parse();
-    let count = a
-        .workers
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get().saturating_sub(1))
-                .unwrap_or(1)
-        })
-        .max(1);
-    if count > 1024 {
-        return Err("at most 1024 workers supported".into());
-    }
-    let batch = a.batch_size.unwrap_or(if a.worker_executable.is_some() {
-        2_000_000_000
-    } else {
-        10000
-    });
-    let request = template_request(&a.recipient, &a.min_work)?;
-    let node = Arc::new(HttpNodeClient::new(
-        &a.node,
-        request,
-        match (a.token_file, a.rpc_cookie_file) {
-            (Some(token), _) => Auth::Bearer(token),
-            (None, Some(cookie)) => Auth::Cookie(cookie),
-            (None, None) => Auth::None,
-        },
-        Duration::from_millis(a.request_timeout_ms),
-        16 * 1024 * 1024,
-    )?);
-    let workers: Vec<Arc<dyn Worker>> = (0..count)
-        .map(|i| {
-            if let Some(path) = &a.worker_executable {
-                let mut w = ProcessWorker::new(format!("worker-{i}"), path.clone());
-                w.arguments = a.worker_arg.clone();
-                Arc::new(w) as Arc<dyn Worker>
-            } else {
-                Arc::new(CpuWorker::new(format!("local-{i}"))) as Arc<dyn Worker>
-            }
-        })
-        .collect();
-    let mut coordinator = Coordinator::new(
-        node,
-        workers,
-        CoordinatorOptions {
-            total_batch_size: if a.once {
-                batch
-            } else {
-                batch.wrapping_mul(count as u64)
-            },
-            stale_probe: !a.no_stale_probe,
-            ..Default::default()
-        },
-    );
+async fn main() {
+    let Command::Run(args) = Cli::parse().command;
     let cancel = CancellationToken::new();
-    let signal = cancel.clone();
+    let stop = cancel.clone();
     tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
         let _ = tokio::signal::ctrl_c().await;
-        signal.cancel();
+        stop.cancel();
     });
-    if a.once {
-        let result = coordinator.run_batch(&cancel).await;
-        println!("{}", serde_json::to_string(&result)?);
-        if matches!(
-            result,
-            Cycle::NodeFailed { .. } | Cycle::WorkerFailed { .. }
-        ) {
-            return Err("coordinator failed; see result".into());
-        }
-    } else {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let task = tokio::spawn(coordinator.run(cancel, tx));
-        let mut failed = false;
-        while let Some(result) = rx.recv().await {
-            failed |= matches!(
-                result,
-                Cycle::NodeFailed { .. } | Cycle::WorkerFailed { .. }
-            );
-            println!("{}", serde_json::to_string(&result)?);
-        }
-        let _ = task.await?;
-        if failed {
-            return Err("coordinator failed; see result".into());
-        }
+    let auth = match (args.token_file, args.cookie_file) {
+        (Some(token), _) => Auth::Bearer(token),
+        (None, Some(cookie)) => Auth::Cookie(cookie),
+        (None, None) => unreachable!("clap requires one"),
+    };
+    let options = RunOptions {
+        node: args.node,
+        auth,
+        config: args.config,
+    };
+    if let Err(e) = run(options, cancel).await {
+        eprintln!("error: {e}");
+        std::process::exit(2);
     }
-    Ok(())
 }

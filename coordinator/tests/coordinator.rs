@@ -314,9 +314,9 @@ async fn repeat_probe_and_pre_submit_probe() {
     assert!(n.submits.lock().unwrap().is_empty());
 }
 #[tokio::test]
-async fn cancellation_ends_batch_and_owned_loop() {
+async fn cancellation_ends_batch() {
     let n = Arc::new(Node::new(work()));
-    let c = Coordinator::new(
+    let mut c = Coordinator::new(
         n.clone(),
         vec![Arc::new(Searcher {
             delay: Duration::from_secs(10),
@@ -325,15 +325,15 @@ async fn cancellation_ends_batch_and_owned_loop() {
         opts(),
     );
     let cancel = CancellationToken::new();
-    let (tx, _rx) = tokio::sync::mpsc::channel(1);
     let token = cancel.clone();
-    let handle = tokio::spawn(c.run(token, tx));
+    let handle = tokio::spawn(async move { c.run_batch(&token).await });
     tokio::task::yield_now().await;
     cancel.cancel();
-    tokio::time::timeout(Duration::from_secs(1), handle)
+    let cycle = tokio::time::timeout(Duration::from_secs(1), handle)
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(cycle, Cycle::Cancelled);
     assert!(n.submits.lock().unwrap().is_empty());
 }
 

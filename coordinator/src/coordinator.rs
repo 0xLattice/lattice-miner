@@ -39,7 +39,12 @@ pub struct Metrics {
     rename_all_fields = "camelCase"
 )]
 pub enum Cycle {
-    Backoff,
+    /// No template: the node has none yet (HTTP 409/503), or the request
+    /// failed (`error`).
+    Backoff {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     NodeFailed {
         error: String,
     },
@@ -195,7 +200,7 @@ impl Coordinator {
             Ok(Some(w)) => Arc::new(w),
             Ok(None) => {
                 self.metrics.retry_backoff_count += 1;
-                return Cycle::Backoff;
+                return Cycle::Backoff { error: None };
             }
             Err(e) => {
                 self.metrics.retry_backoff_count += 1;
@@ -204,7 +209,9 @@ impl Coordinator {
                         error: e.to_string(),
                     }
                 } else {
-                    Cycle::Backoff
+                    Cycle::Backoff {
+                        error: Some(e.to_string()),
+                    }
                 };
             }
         };
@@ -352,40 +359,6 @@ impl Coordinator {
         last_child.unwrap_or_else(|| Cycle::NoSolution {
             work_id: work.work_id.clone(),
         })
-    }
-    /// Owned lifecycle: one mutable coordinator means batches cannot overlap.
-    /// Cancellation stops the current batch and backoff without another submission.
-    pub async fn run(
-        mut self,
-        cancel: CancellationToken,
-        events: tokio::sync::mpsc::Sender<Cycle>,
-    ) -> Metrics {
-        loop {
-            let result = self.run_batch(&cancel).await;
-            let backoff = matches!(
-                result,
-                Cycle::Backoff
-                    | Cycle::Submitted {
-                        submission: Submission {
-                            accepted: false,
-                            ..
-                        },
-                        ..
-                    }
-            );
-            let stop = matches!(
-                result,
-                Cycle::Cancelled | Cycle::NodeFailed { .. } | Cycle::WorkerFailed { .. }
-            );
-            tokio::select! {_=cancel.cancelled()=>break,r=events.send(result)=>if r.is_err(){break;}}
-            if stop {
-                break;
-            }
-            if backoff {
-                tokio::select! {_=cancel.cancelled()=>break,_=tokio::time::sleep(self.options.retry_delay)=>{}}
-            }
-        }
-        self.metrics
     }
 }
 

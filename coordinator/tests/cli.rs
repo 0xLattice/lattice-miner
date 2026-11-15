@@ -1,6 +1,10 @@
 use lattice_cashew::{Header, MerkleDictionary, Volume};
 use lattice_primitives::*;
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -35,84 +39,188 @@ fn block() -> Block {
         nonce: 0,
     }
 }
-#[tokio::test]
-async fn once_cli_real_cpu_worker_local_template_and_submit() {
+/// A node fixture: every template request is answered with `block` at the
+/// easiest target, every submission accepted. It records template request
+/// bodies and the heads of every request.
+async fn node(
+    block: Block,
+) -> (
+    String,
+    Arc<Mutex<Vec<serde_json::Value>>>,
+    Arc<Mutex<Vec<String>>>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let original = block();
-    let prefix = original.pow_prefix();
-    let server = tokio::spawn(async move {
-        for step in 0..2 {
+    let templates = Arc::new(Mutex::new(vec![]));
+    let heads = Arc::new(Mutex::new(vec![]));
+    let (t, h) = (templates.clone(), heads.clone());
+    tokio::spawn(async move {
+        loop {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut bytes = vec![];
-            let mut b = [0];
-            while !bytes.ends_with(b"\r\n\r\n") {
-                socket.read_exact(&mut b).await.unwrap();
-                bytes.push(b[0]);
-            }
-            let headers = String::from_utf8(bytes).unwrap();
-            let len = headers
-                .lines()
-                .find_map(|l| {
-                    l.to_lowercase()
-                        .strip_prefix("content-length:")
-                        .and_then(|n| n.trim().parse::<usize>().ok())
-                })
-                .unwrap_or(0);
-            let mut body = vec![0; len];
-            socket.read_exact(&mut body).await.unwrap();
-            let input: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            let response = if step == 0 {
-                assert!(headers.starts_with("POST /mining/templates "));
-                assert_eq!(input, serde_json::json!({"recipients":[]}));
-                serde_json::json!({"workID":"local-fixture","block":original,"searchTarget":"0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","targets":["0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"],"chainPath":["Nexus"],"expiresInMilliseconds":5000,"templateDigest":"stable"})
-            } else {
-                assert!(headers.starts_with("POST /mining/work "));
-                assert_eq!(input["workID"], "local-fixture");
-                let nonce = input["nonce"].as_u64().unwrap();
-                assert!(nonce < 2);
-                assert!(lattice_pow::hash(&prefix, nonce) <= [255; 32]);
-                serde_json::json!({"accepted":true,"disposition":"accepted","tipCID":"fixture-tip"})
-            };
-            let body = serde_json::to_vec(&response).unwrap();
-            socket
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
+            let (templates, heads, block) = (t.clone(), h.clone(), block.clone());
+            tokio::spawn(async move {
+                let mut bytes = vec![];
+                let mut b = [0];
+                while !bytes.ends_with(b"\r\n\r\n") {
+                    if socket.read_exact(&mut b).await.is_err() {
+                        return;
+                    }
+                    bytes.push(b[0]);
+                }
+                let head = String::from_utf8(bytes).unwrap();
+                let len = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|n| n.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0; len];
+                socket.read_exact(&mut body).await.unwrap();
+                heads.lock().unwrap().push(head.clone());
+                let (status, reply) = if head.starts_with("POST /mining/templates ") {
+                    let n = {
+                        let mut t = templates.lock().unwrap();
+                        t.push(serde_json::from_slice(&body).unwrap());
+                        t.len()
+                    };
+                    (
+                        200,
+                        serde_json::json!({"workID":format!("work-{n}"),"block":block,"searchTarget":"0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","targets":["0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"],"chainPath":["Nexus"],"expiresInMilliseconds":30000,"templateDigest":format!("digest-{n}")}),
                     )
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
-            socket.write_all(&body).await.unwrap();
+                } else if head.starts_with("POST /mining/work ") {
+                    (
+                        200,
+                        serde_json::json!({"accepted":true,"disposition":"accepted","tipCID":"fixture-tip"}),
+                    )
+                } else if head.starts_with("GET /status ") {
+                    let n = templates.lock().unwrap().len();
+                    (
+                        200,
+                        serde_json::json!({"templateDigest":format!("digest-{n}")}),
+                    )
+                } else {
+                    (404, serde_json::json!({"error":{"message":"not found"}}))
+                };
+                let body = serde_json::to_vec(&reply).unwrap();
+                let head = format!(
+                    "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+            });
         }
     });
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        tokio::process::Command::new(env!("CARGO_BIN_EXE_lattice-miner"))
-            .args([
-                "--node",
-                &url,
-                "--once",
-                "--no-stale-probe",
-                "--workers",
-                "2",
-                "--batch-size",
-                "2",
-            ])
-            .output(),
-    )
+    (url, templates, heads)
+}
+
+async fn until(what: &str, condition: impl Fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
     .await
-    .unwrap()
+    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn run_rereads_settings_each_round_and_keeps_the_last_good() {
+    let (url, templates, heads) = node(block()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("miner.json");
+    let token = dir.path().join("token");
+    std::fs::write(&token, "secret").unwrap();
+    std::fs::write(
+        &config,
+        r#"{"worker":"cpu","workers":2,"batchSize":2,"recipients":{"Nexus":"first"}}"#,
+    )
     .unwrap();
+    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_lattice-miner"))
+        .args(["run", "--node", &url, "--token-file"])
+        .arg(&token)
+        .arg("--config")
+        .arg(&config)
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let recipient = |body: &serde_json::Value| body["recipients"][0]["address"].clone();
+    until("a template for the first recipient", || {
+        templates
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|b| recipient(b) == "first")
+    })
+    .await;
+    std::fs::write(
+        &config,
+        r#"{"worker":"cpu","workers":2,"batchSize":2,"recipients":{"Nexus":"second"}}"#,
+    )
+    .unwrap();
+    until("a template for the changed recipient", || {
+        templates
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|b| recipient(b) == "second")
+    })
+    .await;
+    // A file that no longer checks keeps the settings read before.
+    std::fs::write(&config, r#"{"recipents":{"Nexus":"typo"}}"#).unwrap();
+    let seen = templates.lock().unwrap().len();
+    until("more rounds", || templates.lock().unwrap().len() > seen + 3).await;
     assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        templates.lock().unwrap()[seen..]
+            .iter()
+            .all(|b| recipient(b) == "second")
     );
-    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["accepted"], true);
-    assert_eq!(result["result"], "submitted");
-    server.await.unwrap();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id().unwrap() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.status.success());
+    let log = String::from_utf8_lossy(&output.stdout);
+    assert!(log.contains("accepted tip=fixture-tip"), "{log}");
+    assert!(
+        log.contains("mining on with the settings read before"),
+        "{log}"
+    );
+    assert!(log.ends_with("mining stopped\n"), "{log}");
+    let heads = heads.lock().unwrap();
+    assert!(
+        heads
+            .iter()
+            .all(|h| h.contains("authorization: Bearer secret\r\n"))
+    );
+    assert!(heads.iter().any(|h| h.starts_with("GET /mining/events ")));
+    assert!(heads.iter().any(|h| h.starts_with("POST /mining/work ")));
+}
+
+#[test]
+fn run_refuses_a_bad_first_settings_file_and_needs_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("miner.json");
+    std::fs::write(&config, r#"{"recipients":{"Nexus/":"x"}}"#).unwrap();
+    let run = |extra: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_lattice-miner"))
+            .args(["run", "--node", "http://127.0.0.1:9", "--config"])
+            .arg(&config)
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let output = run(&["--cookie-file", "/nonexistent"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("recipients"));
+    assert!(!run(&[]).status.success());
 }
