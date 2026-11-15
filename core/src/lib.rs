@@ -90,14 +90,33 @@ mod tests {
         assert_eq!(
             allocate_ranges(5, 3, u64::MAX - 1),
             vec![
-                NonceRange { start_nonce: u64::MAX - 1, count: 2 },
-                NonceRange { start_nonce: 0, count: 2 },
-                NonceRange { start_nonce: 2, count: 1 },
+                NonceRange {
+                    start_nonce: u64::MAX - 1,
+                    count: 2
+                },
+                NonceRange {
+                    start_nonce: 0,
+                    count: 2
+                },
+                NonceRange {
+                    start_nonce: 2,
+                    count: 1
+                },
             ]
         );
-        assert_eq!(allocate_ranges(0, 0, 7), vec![NonceRange { start_nonce: 7, count: 1 }]);
+        assert_eq!(
+            allocate_ranges(0, 0, 7),
+            vec![NonceRange {
+                start_nonce: 7,
+                count: 1
+            }]
+        );
         assert_eq!(allocate_ranges(2, 9, 0).len(), 2);
-        assert!(NonceRange { start_nonce: u64::MAX, count: 2 }.contains(0));
+        assert!(NonceRange {
+            start_nonce: u64::MAX,
+            count: 2
+        }
+        .contains(0));
     }
 
     #[test]
