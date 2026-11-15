@@ -18,9 +18,9 @@ cuda = ["dep:cudarc"]
 opencl = ["dep:opencl3"]
 
 [dependencies]
+lattice-miner-core = { path = "core" }
 clap = { version = "4", features = ["derive", "env"] }
 sha2 = "0.10"
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
 
@@ -44,7 +44,7 @@ metal = "0.29"
 # (`lattice-miner-core`) live beside this worker. A plain `cargo build` here
 # builds the worker only; `--workspace` builds all three.
 [workspace]
-members = [".", "coordinator"]
+members = [".", "core", "coordinator"]
 resolver = "2"
 
 # lattice-rs and cashew-rs name their sibling repositories by relative path;

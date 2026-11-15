@@ -1139,6 +1139,7 @@ dependencies = [
  "futures-util",
  "hex",
  "lattice-cashew",
+ "lattice-miner-core",
  "lattice-pow",
  "lattice-primitives",
  "nix",
@@ -1155,15 +1156,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-miner-core"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lattice-miner-gpu"
 version = "0.1.0"
 dependencies = [
  "clap",
  "cudarc",
  "hex",
+ "lattice-miner-core",
  "metal",
  "opencl3",
- "serde",
  "serde_json",
  "sha2 0.10.9",
 ]

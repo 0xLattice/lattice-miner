@@ -143,8 +143,7 @@ impl Worker for ProcessWorker {
   let bytes=if let Some(bytes)=early{bytes}else{tokio::time::timeout(self.drain_timeout,&mut out.0).await.map_err(|_|Error::Worker("stdout drain deadline exceeded".into()))?.map_err(|e|Error::Worker(e.to_string()))??};
   let stderr=tokio::time::timeout(self.drain_timeout,&mut err.0).await.map_err(|_|Error::Worker("stderr drain deadline exceeded".into()))?.map_err(|e|Error::Worker(e.to_string()))??;
   if !status.success(){return Err(Error::Worker(format!("exit {status}: {}",String::from_utf8_lossy(&stderr))));}
-  #[derive(serde::Deserialize)]#[serde(rename_all="camelCase")]struct Output {work_id:String,status:String,nonce:Option<u64>,range_start:u64,range_count:u64}
-  let result:Output=serde_json::from_slice(&bytes).map_err(|_|Error::Worker(format!("invalid worker JSON: {}",String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(4096)..]))))?;
+  let result:WorkerOutput=serde_json::from_slice(&bytes).map_err(|_|Error::Worker(format!("invalid worker JSON: {}",String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(4096)..]))))?;
   if result.work_id!=work.work_id||result.range_start!=range.start_nonce||result.range_count!=range.count{return Err(Error::Worker("worker assignment identity/range mismatch".into()));}
   match result.status.as_str(){"found"=>{let nonce=result.nonce.ok_or_else(||Error::Worker("found without nonce".into()))?;if !range.contains(nonce){return Err(Error::Worker("nonce outside assignment".into()));}Ok(Some(WorkerResult{worker_id:self.id.clone(),work_id:result.work_id,nonce}))},"exhausted"=>{if result.nonce.is_some(){return Err(Error::Worker("exhausted with nonce".into()));}Ok(None)},_=>Err(Error::Worker("unknown worker status".into()))}
  }.boxed()

@@ -22,7 +22,7 @@ mod cuda_backend;
 mod opencl_backend;
 
 use clap::Parser;
-use serde::Serialize;
+use lattice_miner_core::{parse_target, WorkerOutput};
 use sha2::{Digest, Sha256};
 
 /// Search one nonce range for a PoW solution.
@@ -89,37 +89,6 @@ fn searched(
         eprintln!("error: {backend} backend failed: {e}");
         std::process::exit(1);
     })
-}
-
-/// Mirror of the worker `WorkerResult` JSON contract.
-#[derive(Serialize)]
-struct WorkerResult {
-    #[serde(rename = "workId")]
-    work_id: String,
-    status: &'static str,
-    nonce: Option<u64>,
-    hash: Option<String>,
-    #[serde(rename = "rangeStart")]
-    range_start: u64,
-    #[serde(rename = "rangeCount")]
-    range_count: u64,
-}
-
-/// Parse a 256-bit big-endian target from hex (optional `0x`), right-aligned.
-fn parse_target(s: &str) -> Option<[u8; 32]> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    if s.is_empty() || s.len() > 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let padded = if s.len() % 2 == 1 {
-        format!("0{s}")
-    } else {
-        s.to_owned()
-    };
-    let bytes = hex::decode(padded).ok()?;
-    let mut out = [0u8; 32];
-    out[32 - bytes.len()..].copy_from_slice(&bytes);
-    Some(out)
 }
 
 /// `digest <= target` as unsigned 256-bit big-endian integers.
@@ -238,17 +207,17 @@ fn main() {
     };
 
     let result = match found {
-        Some((nonce, digest)) => WorkerResult {
+        Some((nonce, digest)) => WorkerOutput {
             work_id: args.work_id,
-            status: "found",
+            status: "found".into(),
             nonce: Some(nonce),
             hash: Some(hex::encode(digest)),
             range_start: args.start_nonce,
             range_count: args.count,
         },
-        None => WorkerResult {
+        None => WorkerOutput {
             work_id: args.work_id,
-            status: "exhausted",
+            status: "exhausted".into(),
             nonce: None,
             hash: None,
             range_start: args.start_nonce,

@@ -12,6 +12,7 @@ name = "lattice-miner"
 path = "src/main.rs"
 
 [dependencies]
+lattice-miner-core = { path = "../core" }
 lattice-primitives = { git = "https://github.com/0xLattice/lattice-rs", rev = "f3501af56b4dc731bc5f8a494f5be5f91ee7d583" }
 lattice-pow = { git = "https://github.com/0xLattice/lattice-rs", rev = "f3501af56b4dc731bc5f8a494f5be5f91ee7d583" }
 lattice-cashew = { git = "https://github.com/0xLattice/cashew-rs", rev = "ba341b7af36e5769d4423cd486ae8f2ac81f9f0c" }

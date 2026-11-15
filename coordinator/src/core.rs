@@ -1,4 +1,4 @@
-use lattice_pow::Target;
+pub use lattice_miner_core::{NonceRange, Target, WorkerOutput, allocate_ranges, parse_target};
 use lattice_primitives::Block;
 use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
@@ -23,43 +23,6 @@ pub enum Error {
     Cancelled,
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NonceRange {
-    pub start_nonce: u64,
-    pub count: u64,
-}
-impl NonceRange {
-    pub fn contains(&self, nonce: u64) -> bool {
-        nonce.wrapping_sub(self.start_nonce) < self.count
-    }
-}
-pub fn allocate_ranges(total: u64, workers: usize, offset: u64) -> Vec<NonceRange> {
-    let workers = workers.max(1);
-    let total = total.max(1);
-    let base = total / (workers as u64);
-    let rem = total % (workers as u64);
-    let mut at = offset;
-    let mut ranges = vec![];
-    for i in 0..workers {
-        let count = base + u64::from((i as u64) < rem);
-        if count > 0 {
-            ranges.push(NonceRange {
-                start_nonce: at,
-                count,
-            });
-            at = at.wrapping_add(count);
-        }
-    }
-    ranges
-}
-pub fn parse_target(s: &str) -> Option<Target> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    if s.is_empty() || s.len() > 64 || !s.bytes().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    hex::decode(format!("{s:0>64}")).ok()?.try_into().ok()
 }
 pub fn parse_minimum_work(s: &str) -> Option<Target> {
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
