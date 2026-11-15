@@ -1,184 +1,231 @@
 #!/usr/bin/env python3
-"""Real local Rust node/coordinator/external CPU worker integration, no public peers.
+"""Mine real blocks with lattice-miner through a local lattice-node.
 
-Build sibling binaries first. Timing gates delay delivery of a genuine CPU result
-only in stale/cancellation cases; successful mining uses the external worker directly.
+A disposable node with no peers hosts Nexus and three children:
+
+    Nexus/C    easy (halfLife 10^6 blocks: its target stays near the maximum)
+    Nexus/P    1 h blocks and halfLife 1: one doubling per block mined early
+    Nexus/P/G  easy, under P
+
+The miner reaches the node only through its remote operator listener, with
+a token scoped to the mining routes, and is never restarted: every change
+below is made to its token file or miner.json while it runs.
+
+1. Scoped token (POST /mining/templates, POST /mining/work, GET /status),
+   built-in CPU worker: GET /mining/events is refused, so the miner polls
+   GET /status. Nexus is mined, then C, P and G are created and mined, each
+   block paying the recipient miner.json names for its chain.
+2. The token gains GET /mining/events: the miner follows the pushed digest.
+3. P is hardened to 2^--hard-bits work. A chain hardens only as its blocks
+   come, and an easy Nexus ends each round at its first hash, so minWork on
+   Nexus is kept at P's work meanwhile: every round's hit then clears P too.
+4. Hard parent: minWork is dropped and the external worker
+   (lattice-miner-gpu, --worker-backend) takes over. For --observe seconds
+   G, under a P 2^--hard-bits times harder, must keep producing valid blocks
+   (the grind walks through the P carrier it misses), far outpacing P; G's
+   longest gap is bounded.
+
+Usage: node-integration.py --node-bin DIR [--miner BIN] [--worker BIN]
+DIR holds lattice-node and lattice built from the lattice-node revision under
+test.
 """
-import argparse
-import base64
-import hashlib
-import json
-import os
-from pathlib import Path
-import queue
-import shutil
-import signal
-import subprocess
-import sys
-import tempfile
-import threading
-import time
-import urllib.error
-import urllib.request
+import argparse, base64, os, hashlib, json, pathlib, shutil, signal, subprocess, tempfile, time, urllib.request
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+PORTS = {'listen': 18401, 'rpc': 18480, 'operator': 18490}
+SCOPED = ['POST /mining/templates', 'POST /mining/work', 'GET /status']
 
 
-def request(base, route, cookie, body=None):
-    headers = {'Content-Type': 'application/json', 'Authorization': 'Basic ' + base64.b64encode(cookie.encode()).decode()}
-    req = urllib.request.Request(base + route, data=None if body is None else json.dumps(body).encode(), headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            return response.status, json.load(response)
-    except urllib.error.HTTPError as error:
-        return error.code, json.load(error)
+def work(target_hex):
+    return (1 << 256) // (int(target_hex, 16) + 1)
 
 
-def start_node(binary, config, logs):
-    child = subprocess.Popen([str(binary), '--config', str(config)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    ready = queue.Queue()
-    def drain(pipe, selected):
-        for line in pipe:
-            logs.append(line.rstrip())
-            if selected and line.startswith('{'):
-                ready.put(json.loads(line))
-    threading.Thread(target=drain, args=(child.stdout, True), daemon=True).start()
-    threading.Thread(target=drain, args=(child.stderr, False), daemon=True).start()
-    try:
-        return child, ready.get(timeout=30)
-    except Exception:
-        child.kill(); child.wait()
-        raise RuntimeError('node failed to start: ' + '\n'.join(logs[-10:]))
+class Node:
+    def __init__(self, bins, root):
+        self.bins, self.root = bins, root
 
+    def ctl(self, *args):
+        return subprocess.run([str(self.bins / 'lattice'), *args, '--root', str(self.root)],
+                              check=True, capture_output=True, text=True).stdout
 
-def stop(child):
-    child.terminate()
-    assert child.wait(timeout=15) == 0, 'node did not stop cleanly'
+    def get(self, route, chain='Nexus'):
+        cookie = (self.root / 'chains/Nexus/.cookie').read_text().strip()
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{PORTS['rpc']}{route}?chainPath={chain}",
+            headers={'Authorization': 'Basic ' + base64.b64encode(cookie.encode()).decode()})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.load(response)
 
-
-def cycle(child):
-    out, err = child.communicate(timeout=20)
-    lines = [json.loads(line) for line in out.splitlines() if line.startswith('{')]
-    assert len(lines) == 1, (out, err)
-    return child.returncode, lines[0]
-
-
-def wait_file(path, child):
-    deadline = time.monotonic() + 15
-    while not path.exists():
-        assert child.poll() is None, 'coordinator exited before worker completed'
-        assert time.monotonic() < deadline, 'worker did not produce its gated result'
-        time.sleep(.02)
-    return json.loads(path.read_text())
-
-
-def wait_gone(pid):
-    deadline = time.monotonic() + 5
-    while True:
+    def height(self, chain):
         try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return
-        assert time.monotonic() < deadline, f'worker process {pid} survived cancellation'
-        time.sleep(.02)
+            return int(self.get('/api/chain/info', chain)['height'])
+        except Exception:
+            return -1
+
+    def block(self, chain, height):
+        return self.get(f'/api/block/{height}', chain)
+
+
+def wait(what, condition, timeout, miner=None):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert miner is None or miner.poll() is None, f'the miner exited while waiting for {what}'
+        assert time.monotonic() < deadline, f'timed out waiting for {what}'
+        time.sleep(0.5)
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output', type=Path, default=ROOT / 'target/node-integration.json')
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--node-bin', type=pathlib.Path, required=True)
+    parser.add_argument('--miner', type=pathlib.Path, default=ROOT / 'target/release/lattice-miner')
+    parser.add_argument('--worker', type=pathlib.Path, default=ROOT / 'target/release/lattice-miner-gpu')
+    parser.add_argument('--worker-backend', default='cpu')
+    parser.add_argument('--cpu-workers', type=int, default=8)
+    parser.add_argument('--hard-bits', type=int, default=30)
+    parser.add_argument('--observe', type=int, default=60)
+    parser.add_argument('--output', type=pathlib.Path, default=ROOT / 'target/node-integration.json')
     args = parser.parse_args()
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    report = {'passed': False, 'scope': 'disposable loopback-only node, coordinator and external CPU worker'}
-    processes, logs = [], []
-    fixture = ROOT.parent / 'lattice-rs/crates/lattice-validation/tests/genesis-swift.json'
+    report = {'passed': False, 'binaries': {}}
+    for path in [args.node_bin / 'lattice-node', args.node_bin / 'lattice', args.miner, args.worker]:
+        report['binaries'][path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    report['nodeVersion'] = subprocess.run([str(args.node_bin / 'lattice-node'), '--version'],
+                                           capture_output=True, text=True).stdout.strip()
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix='lattice-miner-integration-'))
+    root, node, miner = tmp / 'node', Node(args.node_bin, tmp / 'node'), None
+    log_path = tmp / 'miner.log'
     try:
-        with tempfile.TemporaryDirectory(prefix='lattice-mining-integration-') as directory:
-            tmp = Path(directory)
-            binaries = tmp / 'bin'; binaries.mkdir()
-            paths = [ROOT.parent / 'lattice-node-rs/target/debug/lattice-node', ROOT / 'target/debug/lattice-mining-coordinator', ROOT.parent / 'lattice-miner-gpu/target/debug/lattice-miner-gpu']
-            node_bin, coordinator_bin, worker_bin = [Path(shutil.copy2(p, binaries / p.name)) for p in paths]
-            report['binaries'] = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in (node_bin, coordinator_bin, worker_bin)}
-            report['genesis_fixture_sha256'] = hashlib.sha256(fixture.read_bytes()).hexdigest()
-            report['harness_sha256'] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-            with (tmp / 'bootstrap.json').open('w') as output:
-                subprocess.run(['cargo', 'run', '--quiet', '--locked', '-p', 'lattice-validation', '--example', 'genesis_volumes', '--', str(fixture)], cwd=ROOT.parent / 'lattice-rs', stdout=output, check=True)
-            config = {'directory': 'data', 'identityKey': 'identity.key', 'genesisCid': json.loads(fixture.read_text())[0]['cid'], 'bootstrapFiles': ['bootstrap.json'], 'minRelayFee': 0, 'listen': '127.0.0.1:0', 'rpc': '127.0.0.1:0'}
-            config_path = tmp / 'node.json'; config_path.write_text(json.dumps(config))
-            node, ready = start_node(node_bin, config_path, logs); processes.append(node)
-            base = 'http://' + ready['rpc']; cookie_file = tmp / 'data/.cookie'; cookie = cookie_file.read_text().strip()
-            def status():
-                code, result = request(base, '/status', cookie)
-                assert code == 200, result
-                return result
-            def coordinator(executable=worker_bin, extra=(), cookie_path=cookie_file):
-                command = [str(coordinator_bin), '--node', base, '--rpc-cookie-file', str(cookie_path), '--workers', '1', '--batch-size', '64', '--once', '--worker-executable', str(executable)]
-                for argument in extra:
-                    command += ['--worker-arg=' + str(argument)]
-                child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                processes.append(child)
-                return child
-            before = status(); assert before['height'] == '0', before
-            unauthorized = tmp / 'wrong.cookie'; unauthorized.write_text('invalid:cookie')
-            child = coordinator(extra=['--backend', 'cpu'], cookie_path=unauthorized)
-            code, refused = cycle(child); processes.remove(child)
-            assert code != 0 and refused['result'] == 'nodeFailed', refused
-            assert status()['height'] == '0'
-            child = coordinator(extra=['--backend', 'cpu'])
-            code, mined = cycle(child); processes.remove(child)
-            assert code == 0 and mined['result'] == 'submitted' and mined['accepted'], mined
-            accepted = status(); assert accepted['height'] == '1' and accepted['tipCID'] != before['tipCID'], accepted
-            # Execute the real CPU worker on the unchanged node assignment, then
-            # gate delivery so status changes and SIGINT have deterministic timing.
-            wrapper = tmp / 'gated_worker.py'
-            wrapper.write_text('''import json,os,pathlib,subprocess,sys,time
-worker,marker=sys.argv[1:3]
-result=subprocess.check_output([worker,'--backend','cpu']+sys.argv[3:])
-value=json.loads(result)
-assert value['status']=='found',value
-path=pathlib.Path(marker)
-temp=path.with_suffix('.tmp')
-temp.write_text(json.dumps({'pid':os.getpid(),'workerResult':value}))
-os.replace(temp,path)
-while True:time.sleep(1)
-''')
-            marker = tmp / 'stale.json'
-            child = coordinator(Path(sys.executable), [wrapper, worker_bin, marker])
-            held = wait_file(marker, child)
-            code, template = request(base, '/mining/templates', cookie, {'recipients': []}); assert code == 200, template
-            code, advance = request(base, '/mining/work', cookie, {'workID': template['workID'], 'nonce': 0}); assert code == 200, advance
-            assert status()['height'] == '2'
-            code, stale = cycle(child); processes.remove(child)
-            assert code == 0 and stale['result'] == 'stale', stale
-            assert stale['workId'] == held['workerResult']['workId'], (stale, held)
-            wait_gone(held['pid']); assert status()['height'] == '2'
-            marker = tmp / 'cancel.json'
-            child = coordinator(Path(sys.executable), [wrapper, worker_bin, marker])
-            held = wait_file(marker, child)
-            child.send_signal(signal.SIGINT)
-            code, cancelled = cycle(child); processes.remove(child)
-            assert code == 0 and cancelled['result'] == 'cancelled', cancelled
-            wait_gone(held['pid']); assert status()['height'] == '2'
-            stable = status(); stop(node); processes.remove(node)
-            config['bootstrapFiles'] = []; config_path.write_text(json.dumps(config))
-            node, ready = start_node(node_bin, config_path, logs); processes.append(node)
-            base = 'http://' + ready['rpc']; cookie = cookie_file.read_text().strip()
-            recovered = status(); assert recovered['height'] == stable['height'] and recovered['tipCID'] == stable['tipCID'], recovered
-            child = coordinator(extra=['--backend', 'cpu'])
-            code, resumed = cycle(child); processes.remove(child)
-            assert code == 0 and resumed['result'] == 'submitted' and resumed['accepted'], resumed
-            final = status(); assert final['height'] == '3', final
-            stop(node); processes.remove(node)
-            node, ready = start_node(node_bin, config_path, logs); processes.append(node)
-            base = 'http://' + ready['rpc']; cookie = cookie_file.read_text().strip()
-            durable = status(); assert durable['height'] == '3' and durable['tipCID'] == final['tipCID'], durable
-            stop(node); processes.remove(node)
-            report.update(passed=True, unauthorized=refused, initial_mining=mined, stale=stale, cancelled=cancelled, resumed_mining=resumed, durable_height=durable['height'], durable_tip=durable['tipCID'], gated_worker_teardown=True, timing_scope='stale/cancel cases run the real CPU worker then withhold its result; successful mining uses the worker directly')
+        node.ctl('init')
+        (root / 'lattice.json').write_text(json.dumps({
+            'listen': PORTS['listen'], 'rpc': PORTS['rpc'], 'webSocket': 0, 'peers': [],
+            'operatorListen': f"127.0.0.1:{PORTS['operator']}", 'operatorTokens': 'operator-tokens.json'}))
+        node.ctl('up')
+        wait('the node', lambda: node.height('Nexus') >= 0, 60)
+        tokens = {}
+        for name, routes in [('scoped', SCOPED), ('events', SCOPED + ['GET /mining/events'])]:
+            out = tmp / f'{name}.token'
+            node.ctl('tokens', 'create', name, *sum([['--route', r] for r in routes], []), '--out', str(out))
+            tokens[name] = out.read_text().strip()
+        addresses = {}
+        for chain in ['Nexus', 'Nexus/C', 'Nexus/P', 'Nexus/P/G']:
+            key = tmp / (chain.replace('/', '-') + '.key')
+            subprocess.run([str(args.node_bin / 'lattice'), 'key', 'generate', '--out', str(key)],
+                           check=True, capture_output=True)
+            addresses[chain] = json.loads(key.read_text())['address']
+
+        token_file, config = tmp / 'miner.token', tmp / 'miner.json'
+        token_file.write_text(tokens['scoped'])
+        settings = {'worker': 'cpu', 'workers': 4, 'batchSize': 100_000_000,
+                    'recipients': {'Nexus': addresses['Nexus']}}
+        config.write_text(json.dumps(settings))
+        log = open(log_path, 'w')
+        miner = subprocess.Popen(
+            [str(args.miner), 'run', '--node', f"http://127.0.0.1:{PORTS['operator']}",
+             '--token-file', str(token_file), '--config', str(config)],
+            stdout=log, stderr=subprocess.STDOUT,
+            env={**os.environ, 'LATTICE_MINER_BACKEND': args.worker_backend})
+        miner_log = lambda: log_path.read_text()
+
+        # 1. Scoped token: polling, Nexus, then children.
+        wait('Nexus blocks', lambda: node.height('Nexus') >= 3, 120, miner)
+        assert 'GET /mining/events answered HTTP 403' in miner_log(), miner_log()
+        specs = {'Nexus/C': (1000, 1_000_000), 'Nexus/P': (3_600_000, 1), 'Nexus/P/G': (1000, 1_000_000)}
+        for chain, (block_time, half_life) in specs.items():
+            spec = tmp / (chain.replace('/', '-') + '.spec.json')
+            spec.write_text(json.dumps({
+                'maxNumberOfTransactionsPerBlock': 100, 'maxStateGrowth': 100_000, 'maxBlockSize': 1_000_000,
+                'premine': 0, 'targetBlockTime': block_time, 'initialReward': 1000,
+                'halvingInterval': 1_000_000, 'halfLife': half_life, 'wasmPolicies': []}))
+            node.ctl('child', 'create', chain, '--spec', str(spec))
+        settings['recipients'] = addresses
+        config.write_text(json.dumps(settings))
+        wait('blocks on every child', lambda: all(node.height(c) >= 2 for c in specs), 300, miner)
+        for chain in ['Nexus'] + list(specs):
+            latest = node.height(chain)
+            assert node.block(chain, latest)['rewardRecipient'] == addresses[chain], chain
+        report['scopedToken'] = {c: node.height(c) for c in ['Nexus'] + list(specs)}
+
+        # 2. The token gains GET /mining/events, while the miner runs.
+        token_file.write_text(tokens['events'])
+        wait('the event stream', lambda: 'following GET /mining/events' in miner_log(), 60, miner)
+
+        # 3. Harden P: minWork on Nexus tracks P's work, so each round's hit
+        # (which must clear Nexus's minimum) also clears P.
+        settings.update(workers=args.cpu_workers, batchSize=4_000_000_000)
+        p_work = lambda: work(node.block('Nexus/P', node.height('Nexus/P'))['nextTarget'])
+        started = time.monotonic()
+        while (current := p_work()) < 1 << args.hard_bits:
+            assert miner.poll() is None, 'the miner exited'
+            assert time.monotonic() - started < 1800, 'P did not harden'
+            if settings.get('minWork') != {'Nexus': str(current)}:
+                settings['minWork'] = {'Nexus': str(current)}
+                config.write_text(json.dumps(settings))
+            time.sleep(0.5)
+        report['warmup'] = {'seconds': round(time.monotonic() - started),
+                            'heights': {c: node.height(c) for c in ['Nexus'] + list(specs)}}
+
+        # 4. Hard parent: no minimum work; the external worker.
+        settings.pop('minWork', None)
+        settings.update(worker=str(args.worker), workers=1, batchSize=100_000_000)
+        config.write_text(json.dumps(settings))
+        # The round in flight finishes on the settings read before: its search
+        # is capped at the binding minimum, so wait for the block that ends it.
+        held = node.height('Nexus')
+        deadline = time.monotonic() + 300
+        while node.height('Nexus') == held:
+            assert time.monotonic() < deadline, 'the warm-up round did not end'
+            time.sleep(0.5)
+        chains = ['Nexus'] + list(specs)
+        before = {c: node.height(c) for c in chains}
+        g_work = work(node.block('Nexus/P/G', before['Nexus/P/G'])['nextTarget'])
+        hard_p_work = p_work()
+        g_last, g_last_at, longest_gap = before['Nexus/P/G'], time.monotonic(), 0.0
+        end = time.monotonic() + args.observe
+        while time.monotonic() < end:
+            assert miner.poll() is None, 'the miner exited'
+            height = node.height('Nexus/P/G')
+            now = time.monotonic()
+            if height > g_last:
+                longest_gap = max(longest_gap, now - g_last_at)
+                g_last, g_last_at = height, now
+            time.sleep(0.5)
+        longest_gap = max(longest_gap, time.monotonic() - g_last_at)
+        after = {c: node.height(c) for c in chains}
+        advanced = {c: after[c] - before[c] for c in chains}
+        report['hardParent'] = {
+            'seconds': args.observe, 'advanced': advanced,
+            'pWorkLog2': hard_p_work.bit_length() - 1, 'gWorkLog2': g_work.bit_length() - 1,
+            'gLongestGapSeconds': round(longest_gap, 1)}
+        # P can still land (it is hard, not unreachable); G must far outpace it.
+        assert advanced['Nexus/P/G'] >= 10 * max(advanced['Nexus/P'], 1), advanced
+        assert advanced['Nexus/P/G'] >= 10 and advanced['Nexus/C'] >= 10, advanced
+        assert longest_gap < 20, longest_gap
+        for chain in ['Nexus/C', 'Nexus/P/G']:
+            for height in range(before[chain] + 1, after[chain] + 1):
+                assert node.block(chain, height)['rewardRecipient'] == addresses[chain], (chain, height)
+
+        miner.send_signal(signal.SIGTERM)
+        assert miner.wait(timeout=30) == 0, miner_log()
+        assert miner_log().rstrip().endswith('mining stopped'), miner_log()
+        text = miner_log()
+        report['minerLog'] = {
+            'accepted': text.count('accepted tip='), 'childOnly': text.count('(childOnly)'),
+            'notMining': text.count('NOT MINING'), 'deadlineExceeded': text.count('ROUND DEADLINE'),
+            'workerFailures': text.count('failed (')}
+        assert report['minerLog']['deadlineExceeded'] == 0 and report['minerLog']['workerFailures'] == 0, text
+        report['passed'] = True
     finally:
-        for child in processes:
-            child.kill(); child.wait()
-        args.output.with_suffix('.log').write_text('\n'.join(logs) + '\n')
+        if miner and miner.poll() is None:
+            miner.kill()
+        try:
+            node.ctl('down')
+        except Exception:
+            pass
+        if log_path.exists():
+            report['minerLogTail'] = log_path.read_text().splitlines()[-15:]
+        args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, indent=2) + '\n')
-    print(json.dumps(report, indent=2))
+        print(json.dumps(report, indent=2))
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == '__main__':
