@@ -1,12 +1,15 @@
 {
-  "node_revision": "3df9e0a786c7b103a3da88d1c3881efc81706255",
-  "lattice_revision": "dda2d852429a27be6043599b63bde81530cd9514",
-  "source_sha256": {
-    "Sources/LatticeMinerCore/MinerLoopLogic.swift": "c4d10654a173aa3717fa049e535a5407d8797fc431adce6a829ddb72ef813bc1",
-    "Sources/LatticeMinerCore/ProofOfWork.swift": "c1bb1a692c865b1ec6a219179cb18d5034aadc720b556555cc10a774d895cd59",
-    "Sources/LatticeMiningCoordinator/MiningCoordinator.swift": "779f91f571dacd1329055313a3e64f4864040b853617b3c3eaa8590310066dd7"
+  "node_revision": "14867065bcdbd52049ea9ee594738df350559069",
+  "lattice": {
+    "revision": "9947a23d72578257388263fcd623cd4621fb31a3",
+    "version": "56.1.2"
   },
-  "package_resolved_sha256": "958f69bd3ec734a372e8cd94e3d09d593674a1025979a2abe2b45a6f08cfc9a6",
-  "fixture_sha256": "a9607c300e364d2d516debdaefecd40d4007a21d0a2b31c64d4097a46d888822",
+  "source_sha256": {
+    "Sources/LatticeMinerCore/MinerLoopLogic.swift": "88b622c4329903d5855a31f96f2425b6b378ced8d78f851a2b10cc2aa27709b0",
+    "Sources/LatticeMinerCore/ProofOfWork.swift": "c1bb1a692c865b1ec6a219179cb18d5034aadc720b556555cc10a774d895cd59",
+    "Sources/LatticeMiningCoordinator/MiningCoordinator.swift": "947f2efe0e0a5425da980eb7b5026c447f5c8e5b67925a90a31559c06184334a"
+  },
+  "package_resolved_sha256": "206d67452a1649b53586a04c86cf6d85ff65fb17dff8f1263995fe4130f5b356",
+  "fixture_sha256": "e4c59b0396f9208c5dc63ae98ac737c51c9c9d662beb1693b238fe3bf11296eb",
   "scope": "Actual unchanged miner core/coordinator with deterministic injected worker/node; no live HTTP/mining."
 }

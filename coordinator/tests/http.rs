@@ -41,7 +41,7 @@ fn client(url: &str) -> HttpNodeClient {
     HttpNodeClient::new(
         url,
         serde_json::json!({"recipients":[]}),
-        None,
+        Auth::None,
         Duration::from_secs(1),
         1024,
     )
@@ -78,7 +78,7 @@ async fn submit_contract_cookie_and_refusals() {
     let c = HttpNodeClient::new(
         &url,
         serde_json::json!({}),
-        Some(cookie),
+        Auth::Cookie(cookie),
         Duration::from_secs(1),
         1024,
     )
@@ -110,7 +110,7 @@ fn decode_http_and_url_policy() {
     assert!(decode_submission(409, br#"{"accepted":false,"disposition":"stale"}"#).is_ok());
     assert!(decode_submission(200, b"not json").is_err());
     for url in [
-        "http://public.example",
+        "ftp://node.example",
         "https://user:pass@example.com",
         "https://a.example/?token=x",
     ] {
@@ -118,7 +118,7 @@ fn decode_http_and_url_policy() {
             HttpNodeClient::new(
                 url,
                 serde_json::json!({}),
-                None,
+                Auth::None,
                 Duration::from_secs(1),
                 1024
             )

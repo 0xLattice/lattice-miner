@@ -19,6 +19,8 @@ pub enum Error {
     Content(#[from] lattice_cashew::Error),
     #[error("worker: {0}")]
     Worker(String),
+    #[error("no answer within the request deadline")]
+    Timeout,
     #[error("cancelled")]
     Cancelled,
     #[error("I/O: {0}")]
@@ -73,7 +75,6 @@ pub struct TemplateResponse {
     pub search_target: lattice_primitives::UInt256,
     pub targets: Vec<lattice_primitives::UInt256>,
     pub chain_path: Vec<String>,
-    pub expires_in_milliseconds: u64,
     pub template_digest: String,
 }
 /// Immutable assignment data, constructed only after canonical block encoding.
@@ -84,7 +85,6 @@ pub struct Work {
     pub prefix: Vec<u8>,
     pub target: Target,
     pub targets: Vec<Target>,
-    pub lifetime: Option<std::time::Duration>,
     pub stale_token: String,
 }
 impl TryFrom<TemplateResponse> for Work {
@@ -107,7 +107,6 @@ impl TryFrom<TemplateResponse> for Work {
             prefix: t.block.pow_prefix(),
             target,
             targets: targets.into_iter().rev().collect(),
-            lifetime: Some(std::time::Duration::from_millis(t.expires_in_milliseconds)),
             stale_token: t.template_digest,
         })
     }

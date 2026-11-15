@@ -70,6 +70,11 @@ pub struct CoordinatorOptions {
     pub probe_interval: Duration,
     pub retry_delay: Duration,
     pub max_submit_retries: usize,
+    /// The node's template digest as `GET /mining/events` pushes it
+    /// ([`HttpNodeClient::digest_feed`]), `None` while not connected. While
+    /// connected, a pushed digest other than the work's ends the batch as
+    /// stale; while not, the status route is polled every `probe_interval`.
+    pub digests: Option<tokio::sync::watch::Receiver<Option<String>>>,
 }
 impl Default for CoordinatorOptions {
     fn default() -> Self {
@@ -80,6 +85,7 @@ impl Default for CoordinatorOptions {
             probe_interval: Duration::from_secs(2),
             retry_delay: Duration::from_millis(250),
             max_submit_retries: 3,
+            digests: None,
         }
     }
 }
@@ -90,6 +96,11 @@ pub struct Coordinator {
     next_nonce: u64,
     nonce_work: Option<String>,
     metrics: Metrics,
+}
+enum BatchEvent {
+    Search(usize, NonceRange, Result<Option<WorkerResult>, Error>),
+    Fresh,
+    Stale,
 }
 struct CancelGuard(CancellationToken);
 impl Drop for CancelGuard {
@@ -218,21 +229,20 @@ impl Coordinator {
             .fold(self.next_nonce, |n, r| n.wrapping_add(r.count));
         let child = cancel.child_token();
         let _guard = CancelGuard(child.clone());
-        enum Event {
-            Search(usize, NonceRange, Result<Option<WorkerResult>, Error>),
-            Fresh,
-            Stale,
-            Expired,
-        }
-        let mut tasks: FuturesUnordered<BoxFuture<'static, Event>> = FuturesUnordered::new();
+        let mut tasks: FuturesUnordered<BoxFuture<'static, BatchEvent>> = FuturesUnordered::new();
         let workers = self.workers.clone();
-        let search = |tasks: &mut FuturesUnordered<BoxFuture<'static, Event>>,
+        let search = |tasks: &mut FuturesUnordered<BoxFuture<'static, BatchEvent>>,
                       i: usize,
                       assignment: Arc<Work>,
                       range: NonceRange| {
             let worker = workers[i].clone();
             let cancel = child.clone();
-            tasks.push(async move{Event::Search(i,range,worker.search(assignment,range,cancel).await)}.boxed());
+            tasks.push(
+                async move {
+                    BatchEvent::Search(i, range, worker.search(assignment, range, cancel).await)
+                }
+                .boxed(),
+            );
         };
         for (i, range) in ranges.iter().enumerate() {
             search(&mut tasks, i, work.clone(), *range);
@@ -245,34 +255,29 @@ impl Coordinator {
             tasks.push(
                 async move {
                     if matches!(node.stale_token().await,Ok(Some(t))if t!=token) {
-                        Event::Stale
+                        BatchEvent::Stale
                     } else {
-                        Event::Fresh
+                        BatchEvent::Fresh
                     }
                 }
                 .boxed(),
             );
-            let node = self.node.clone();
-            let token = work.stale_token.clone();
-            let interval = self.options.probe_interval;
+            // The tip can move at any point in a batch, and against a hard
+            // target no submission comes along to notice it, so freshness is
+            // watched until the batch ends: pushed when the node streams its
+            // digest, polled when it does not. Taken before the first probe,
+            // so a change that probe misses is a change here.
+            let mut digests = self.options.digests.clone();
+            if let Some(feed) = digests.as_mut() {
+                feed.borrow_and_update();
+            }
             tasks.push(
-                async move {
-                    loop {
-                        tokio::time::sleep(interval).await;
-                        if matches!(node.stale_token().await,Ok(Some(t))if t!=token) {
-                            return Event::Stale;
-                        }
-                    }
-                }
-                .boxed(),
-            );
-        }
-        if let Some(lifetime) = work.lifetime {
-            tasks.push(
-                async move {
-                    tokio::time::sleep(lifetime).await;
-                    Event::Expired
-                }
+                watch_freshness(
+                    self.node.clone(),
+                    digests,
+                    work.stale_token.clone(),
+                    self.options.probe_interval,
+                )
                 .boxed(),
             );
         }
@@ -281,23 +286,14 @@ impl Coordinator {
         while searching > 0 || probing {
             let event = tokio::select! {biased;_=cancel.cancelled()=>return Cycle::Cancelled,e=tasks.next()=>match e{Some(e)=>e,None=>break}};
             match event {
-                Event::Fresh => probing = false,
-                Event::Stale => {
+                BatchEvent::Fresh => probing = false,
+                BatchEvent::Stale => {
                     self.metrics.stale_abort_count += 1;
                     return Cycle::Stale {
                         work_id: work.work_id.clone(),
                     };
                 }
-                Event::Expired => {
-                    if let Some(last) = last_child {
-                        return last;
-                    }
-                    self.metrics.stale_abort_count += 1;
-                    return Cycle::Stale {
-                        work_id: work.work_id.clone(),
-                    };
-                }
-                Event::Search(i, range, result) => {
+                BatchEvent::Search(i, range, result) => {
                     searching -= 1;
                     let result = match result {
                         Ok(Some(r)) if r.work_id == work.work_id => r,
@@ -390,5 +386,49 @@ impl Coordinator {
             }
         }
         self.metrics
+    }
+}
+
+/// Resolves only when the work is stale. While the digest feed is connected,
+/// each digest it pushes is compared with the work's; a pushed digest says
+/// nothing about the chain until it differs. While it is not connected the
+/// status route is polled, and a reconnect's first push is compared at once,
+/// since changes made while disconnected were never pushed.
+async fn watch_freshness(
+    node: Arc<dyn NodeClient>,
+    mut digests: Option<tokio::sync::watch::Receiver<Option<String>>>,
+    token: String,
+    interval: Duration,
+) -> BatchEvent {
+    let mut compare = false;
+    loop {
+        if let Some(feed) = digests.as_mut() {
+            let pushed = feed.borrow_and_update().clone();
+            if let Some(digest) = pushed {
+                if compare && digest != token {
+                    return BatchEvent::Stale;
+                }
+                compare = true;
+                if feed.changed().await.is_err() {
+                    digests = None;
+                }
+                continue;
+            }
+            tokio::select! {
+                changed = feed.changed() => {
+                    if changed.is_err() {
+                        digests = None;
+                    }
+                    compare = true;
+                    continue;
+                }
+                _ = tokio::time::sleep(interval) => {}
+            }
+        } else {
+            tokio::time::sleep(interval).await;
+        }
+        if matches!(node.stale_token().await, Ok(Some(t)) if t != token) {
+            return BatchEvent::Stale;
+        }
     }
 }

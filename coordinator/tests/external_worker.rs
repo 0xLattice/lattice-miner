@@ -1,5 +1,5 @@
 use lattice_miner::*;
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 #[tokio::test]
 #[ignore = "requires LATTICE_TEST_WORKER pointing to the separately built worker"]
@@ -14,7 +14,6 @@ async fn actual_external_cpu_and_automatic_backend_wrapping_contract() {
             prefix: b"offline fixture only".to_vec(),
             target: [255; 32],
             targets: vec![[255; 32]],
-            lifetime: Some(Duration::from_secs(10)),
             stale_token: "fixed".into(),
         });
         let range = NonceRange {

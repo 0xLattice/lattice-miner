@@ -9,6 +9,8 @@ struct Args {
     node: String,
     #[arg(long)]
     rpc_cookie_file: Option<PathBuf>,
+    #[arg(long, conflicts_with = "rpc_cookie_file")]
+    token_file: Option<PathBuf>,
     #[arg(long)]
     workers: Option<usize>,
     #[arg(long)]
@@ -51,7 +53,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node = Arc::new(HttpNodeClient::new(
         &a.node,
         request,
-        a.rpc_cookie_file,
+        match (a.token_file, a.rpc_cookie_file) {
+            (Some(token), _) => Auth::Bearer(token),
+            (None, Some(cookie)) => Auth::Cookie(cookie),
+            (None, None) => Auth::None,
+        },
         Duration::from_millis(a.request_timeout_ms),
         16 * 1024 * 1024,
     )?);

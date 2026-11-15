@@ -16,7 +16,6 @@ fn work() -> Work {
         prefix: b"fixture".to_vec(),
         target: [255; 32],
         targets: vec![[255; 32]],
-        lifetime: None,
         stale_token: "stable".into(),
     }
 }
@@ -254,13 +253,11 @@ async fn offset_tracks_same_work_and_resets_changed_work() {
     );
 }
 #[tokio::test]
-async fn stale_expiry_failures_and_wrong_identity() {
+async fn stale_failures_and_wrong_identity() {
+    // Mode 1 is a slow search no probe interrupts: work never expires on a
+    // clock, so it runs to its end.
     for mode in 0..5 {
-        let mut w = work();
-        if mode == 1 {
-            w.lifetime = Some(Duration::from_millis(2));
-        }
-        let n = Arc::new(Node::new(w));
+        let n = Arc::new(Node::new(work()));
         if mode == 0 {
             n.tokens.lock().unwrap().push_back(1);
         }
@@ -286,11 +283,12 @@ async fn stale_expiry_failures_and_wrong_identity() {
         .await
         .unwrap();
         match mode {
-            0 | 1 => assert!(matches!(r, Cycle::Stale { .. })),
+            0 => assert!(matches!(r, Cycle::Stale { .. })),
+            1 => assert!(matches!(r, Cycle::Submitted { .. })),
             2 => assert!(matches!(r, Cycle::WorkerFailed { .. })),
             _ => assert!(matches!(r, Cycle::NoSolution { .. })),
         }
-        assert!(n.submits.lock().unwrap().is_empty());
+        assert_eq!(n.submits.lock().unwrap().is_empty(), mode != 1);
     }
 }
 #[tokio::test]
@@ -384,9 +382,6 @@ async fn actual_swift_core_and_cycle_differential() {
             w.targets.push(hard);
             total = last + 1;
         }
-        if mode == "expire" {
-            w.lifetime = Some(Duration::from_millis(1));
-        }
         let n = Arc::new(Node::new(w.clone()));
         match mode {
             "no_work" => *n.works.lock().unwrap() = VecDeque::from([None]),
@@ -407,7 +402,7 @@ async fn actual_swift_core_and_cycle_differential() {
             _ => {}
         }
         let worker = Arc::new(Searcher {
-            delay: if mode == "expire" {
+            delay: if mode == "slow" {
                 Duration::from_millis(50)
             } else {
                 Duration::ZERO

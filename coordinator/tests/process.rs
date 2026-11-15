@@ -9,30 +9,39 @@ fn work() -> Arc<Work> {
         prefix: vec![1],
         target: [255; 32],
         targets: vec![[255; 32]],
-        lifetime: None,
         stale_token: "stable".into(),
     })
 }
 async fn run(code: &str) -> Result<Option<WorkerResult>, Error> {
     run_for(code, None).await
 }
-async fn run_for(code: &str, lifetime: Option<Duration>) -> Result<Option<WorkerResult>, Error> {
+/// Runs the worker script, cancelling its search after `cancel_after`.
+async fn run_for(
+    code: &str,
+    cancel_after: Option<Duration>,
+) -> Result<Option<WorkerResult>, Error> {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("worker.py");
     std::fs::write(&path, format!("import sys,json,time,os\n{code}\n")).unwrap();
     let mut worker = ProcessWorker::new("p", "python3".into());
     worker.arguments = vec![path.to_string_lossy().into_owned()];
-    let mut assignment = (*work()).clone();
-    assignment.lifetime = lifetime;
+    let cancel = CancellationToken::new();
+    if let Some(after) = cancel_after {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            cancel.cancel();
+        });
+    }
     tokio::time::timeout(
         Duration::from_secs(10),
         worker.search(
-            Arc::new(assignment),
+            work(),
             NonceRange {
                 start_nonce: u64::MAX,
                 count: 2,
             },
-            CancellationToken::new(),
+            cancel,
         ),
     )
     .await
@@ -62,7 +71,7 @@ async fn stderr_flood_is_drained_and_tail_bounded() {
     assert!(e.len() < 4300);
 }
 #[tokio::test]
-async fn stdout_flood_and_deadline_fail_bounded() {
+async fn stdout_flood_and_closed_stdout_bounded() {
     assert!(
         run("sys.stdout.write('x'*200000);sys.stdout.flush();time.sleep(10)")
             .await
@@ -88,8 +97,7 @@ async fn cancellation_kills_descendant_group() {
     worker.arguments = vec![script.to_str().unwrap().into()];
     let cancel = CancellationToken::new();
     let token = cancel.clone();
-    let mut w = (*work()).clone();
-    w.lifetime = None;
+    let w = (*work()).clone();
     let task = tokio::spawn(async move {
         worker
             .search(

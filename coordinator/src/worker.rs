@@ -125,27 +125,119 @@ impl Worker for ProcessWorker {
         range: NonceRange,
         cancel: CancellationToken,
     ) -> BoxFuture<'_, Result<Option<WorkerResult>, Error>> {
-        async move{
-  let mut command=Command::new(&self.executable);command.args(&self.arguments).args(["--work-id",&work.work_id,"--block-hex",&work.block_hex,"--target",&hex::encode(work.target),"--start-nonce",&range.start_nonce.to_string(),"--count",&range.count.to_string()]);
-  if !work.prefix.is_empty(){command.args(["--prefix-hex",&hex::encode(&work.prefix)]);}
-  command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
-  #[cfg(unix)]{use std::os::unix::process::CommandExt;command.as_std_mut().process_group(0);}
-  let mut child=command.spawn()?;
-  #[cfg(unix)]let group=GroupGuard(child.id().expect("spawned PID") as i32);
-  let stdout=child.stdout.take().unwrap();let stderr=child.stderr.take().unwrap();let maximum=self.maximum_stdout;let mut out=ReaderGuard(tokio::spawn(output(stdout,maximum,false)));let mut err=ReaderGuard(tokio::spawn(output(stderr,4096,true)));
-  let expiry=async{if let Some(d)=work.lifetime{tokio::time::sleep(d).await}else{std::future::pending().await}};
-  tokio::pin!(expiry);
-  let mut early=None;
-  let status=tokio::select!{biased;_=cancel.cancelled()=>{let _=child.kill().await;return Ok(None);},_=&mut expiry=>{let _=child.kill().await;return Ok(None);},result=&mut out.0=>{early=Some(result.map_err(|e|Error::Worker(e.to_string()))??);tokio::select!{_=cancel.cancelled()=>{let _=child.kill().await;return Ok(None);},_=&mut expiry=>{let _=child.kill().await;return Ok(None);},s=child.wait()=>s?}},s=child.wait()=>s?};
-  // The direct child may have left descendants holding pipe ends. Always tear
-  // down its isolated process group before the bounded final drain.
-  #[cfg(unix)]drop(group);
-  let bytes=if let Some(bytes)=early{bytes}else{tokio::time::timeout(self.drain_timeout,&mut out.0).await.map_err(|_|Error::Worker("stdout drain deadline exceeded".into()))?.map_err(|e|Error::Worker(e.to_string()))??};
-  let stderr=tokio::time::timeout(self.drain_timeout,&mut err.0).await.map_err(|_|Error::Worker("stderr drain deadline exceeded".into()))?.map_err(|e|Error::Worker(e.to_string()))??;
-  if !status.success(){return Err(Error::Worker(format!("exit {status}: {}",String::from_utf8_lossy(&stderr))));}
-  let result:WorkerOutput=serde_json::from_slice(&bytes).map_err(|_|Error::Worker(format!("invalid worker JSON: {}",String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(4096)..]))))?;
-  if result.work_id!=work.work_id||result.range_start!=range.start_nonce||result.range_count!=range.count{return Err(Error::Worker("worker assignment identity/range mismatch".into()));}
-  match result.status.as_str(){"found"=>{let nonce=result.nonce.ok_or_else(||Error::Worker("found without nonce".into()))?;if !range.contains(nonce){return Err(Error::Worker("nonce outside assignment".into()));}Ok(Some(WorkerResult{worker_id:self.id.clone(),work_id:result.work_id,nonce}))},"exhausted"=>{if result.nonce.is_some(){return Err(Error::Worker("exhausted with nonce".into()));}Ok(None)},_=>Err(Error::Worker("unknown worker status".into()))}
- }.boxed()
+        async move {
+            let mut command = Command::new(&self.executable);
+            command.args(&self.arguments).args([
+                "--work-id",
+                &work.work_id,
+                "--block-hex",
+                &work.block_hex,
+                "--target",
+                &hex::encode(work.target),
+                "--start-nonce",
+                &range.start_nonce.to_string(),
+                "--count",
+                &range.count.to_string(),
+            ]);
+            if !work.prefix.is_empty() {
+                command.args(["--prefix-hex", &hex::encode(&work.prefix)]);
+            }
+            command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                command.as_std_mut().process_group(0);
+            }
+            let mut child = command.spawn()?;
+            #[cfg(unix)]
+            let group = GroupGuard(child.id().expect("spawned PID") as i32);
+            let stdout = child.stdout.take().unwrap();
+            let stderr = child.stderr.take().unwrap();
+            let mut out = ReaderGuard(tokio::spawn(output(stdout, self.maximum_stdout, false)));
+            let mut err = ReaderGuard(tokio::spawn(output(stderr, 4096, true)));
+            // Work never expires on a clock: only cancellation (the work went
+            // stale, or the batch ended) stops a search early.
+            let mut early = None;
+            let status = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    let _ = child.kill().await;
+                    return Ok(None);
+                }
+                result = &mut out.0 => {
+                    early = Some(result.map_err(|e| Error::Worker(e.to_string()))??);
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            let _ = child.kill().await;
+                            return Ok(None);
+                        }
+                        s = child.wait() => s?,
+                    }
+                }
+                s = child.wait() => s?,
+            };
+            // The direct child may have left descendants holding pipe ends. Always tear
+            // down its isolated process group before the bounded final drain.
+            #[cfg(unix)]
+            drop(group);
+            let bytes = match early {
+                Some(bytes) => bytes,
+                None => tokio::time::timeout(self.drain_timeout, &mut out.0)
+                    .await
+                    .map_err(|_| Error::Worker("stdout drain deadline exceeded".into()))?
+                    .map_err(|e| Error::Worker(e.to_string()))??,
+            };
+            let stderr = tokio::time::timeout(self.drain_timeout, &mut err.0)
+                .await
+                .map_err(|_| Error::Worker("stderr drain deadline exceeded".into()))?
+                .map_err(|e| Error::Worker(e.to_string()))??;
+            if !status.success() {
+                return Err(Error::Worker(format!(
+                    "exit {status}: {}",
+                    String::from_utf8_lossy(&stderr)
+                )));
+            }
+            let result: WorkerOutput = serde_json::from_slice(&bytes).map_err(|_| {
+                Error::Worker(format!(
+                    "invalid worker JSON: {}",
+                    String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(4096)..])
+                ))
+            })?;
+            if result.work_id != work.work_id
+                || result.range_start != range.start_nonce
+                || result.range_count != range.count
+            {
+                return Err(Error::Worker(
+                    "worker assignment identity/range mismatch".into(),
+                ));
+            }
+            match result.status.as_str() {
+                "found" => {
+                    let nonce = result
+                        .nonce
+                        .ok_or_else(|| Error::Worker("found without nonce".into()))?;
+                    if !range.contains(nonce) {
+                        return Err(Error::Worker("nonce outside assignment".into()));
+                    }
+                    Ok(Some(WorkerResult {
+                        worker_id: self.id.clone(),
+                        work_id: result.work_id,
+                        nonce,
+                    }))
+                }
+                "exhausted" => {
+                    if result.nonce.is_some() {
+                        return Err(Error::Worker("exhausted with nonce".into()));
+                    }
+                    Ok(None)
+                }
+                _ => Err(Error::Worker("unknown worker status".into())),
+            }
+        }
+        .boxed()
     }
 }

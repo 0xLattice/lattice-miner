@@ -374,21 +374,26 @@
         }
       ],
       "metrics": {
-        "accepted": 0,
+        "accepted": 1,
         "assigned": 1,
         "backoff": 0,
         "failure": 0,
         "rejected": 0,
-        "stale": 1
+        "stale": 0
       },
-      "mode": "expire",
+      "mode": "slow",
       "results": [
         {
-          "result": "stale",
+          "accepted": "true",
+          "disposition": "accepted",
+          "nonce": "0",
+          "result": "submitted",
           "workId": "one"
         }
       ],
-      "submissions": []
+      "submissions": [
+        "0"
+      ]
     }
   ],
   "parses": [

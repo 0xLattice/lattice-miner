@@ -20,14 +20,14 @@ func output(_ result:MiningCoordinatorCycleResult)->[String:String]{switch resul
  var parses:[[String:Any]]=[]
  for value in ["","0","1","0x1","f","0xF","0XFF","-1"," ",String(repeating:"f",count:64),String(repeating:"f",count:65),"2^0","2^32","2^255","2^256","2^-1","01","18446744073709551616"] {parses.append(["input":value,"target":MinerLoopLogic.parseTarget(value).map{$0.toHexString()} as Any? ?? NSNull(),"work":MinerLoopLogic.parseMinimumWork(value).map{$0.toHexString()} as Any? ?? NSNull()])}
  var cycles:[[String:Any]]=[]
- for mode in ["accepted","rejected","transient","exhaust_retries","unauthorized","stale_retry","no_work","worker_failure","no_solution","wrong_id","offsets","merged","expire"] {
+ for mode in ["accepted","rejected","transient","exhaust_retries","unauthorized","stale_retry","no_work","worker_failure","no_solution","wrong_id","offsets","merged","slow"] {
  let ledger=Ledger();let prefix=ContiguousArray("fixture".utf8);let midstate=ProofOfWork.midstate(prefixBytes:prefix);let first=ProofOfWork.hash(midstate:midstate,nonce:0);var hard=first;var last:UInt64=1
  while true {hard=ProofOfWork.hash(midstate:midstate,nonce:last);if hard<first{break};last+=1}
- let work=MiningCoordinatorWork(workId:"one",blockHex:"00",prefixHex:mode=="merged" ? Data(prefix).map{String(format:"%02x",$0)}.joined():"",targetHex:String(repeating:"f",count:64),targets:mode=="merged" ? [.max,hard]:[.max],expiresInMilliseconds:mode=="expire" ? 1:nil,staleToken:"stable")
+ let work=MiningCoordinatorWork(workId:"one",blockHex:"00",prefixHex:mode=="merged" ? Data(prefix).map{String(format:"%02x",$0)}.joined():"",targetHex:String(repeating:"f",count:64),targets:mode=="merged" ? [.max,hard]:[.max],staleToken:"stable")
  let node=Node(mode,work)
  let worker=MiningCoordinatorWorker(id:"test"){work,range in
  await ledger.add(work,range)
- if mode=="expire" {try await Task.sleep(nanoseconds:50_000_000);return nil}
+ if mode=="slow" {try await Task.sleep(nanoseconds:50_000_000)}
  if mode=="worker_failure"{throw Failure.fixture};if mode=="no_solution"||mode=="offsets"{return nil}
  let nonce:UInt64
  if mode=="merged" {guard let found=ProofOfWork.searchBatch(midstate:midstate,target:MinerLoopLogic.parseTarget(work.targetHex)!,startNonce:range.startNonce,count:range.count)else{return nil};nonce=found}else{nonce=range.startNonce}
