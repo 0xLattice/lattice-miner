@@ -22,13 +22,13 @@ jobs:
           - platform: linux-amd64
             runner: ubuntu-latest
             container: ubuntu:20.04
-            features: --features cuda,opencl
+            features: --features lattice-miner-gpu/cuda,lattice-miner-gpu/opencl
             exe: ''
             rustflags: ''
           - platform: windows-amd64
             runner: windows-latest
             container: ''
-            features: --features cuda,opencl
+            features: --features lattice-miner-gpu/cuda,lattice-miner-gpu/opencl
             exe: .exe
             # Static C runtime: a clean Windows has no VCRUNTIME140.dll.
             rustflags: -C target-feature=+crt-static
@@ -67,8 +67,8 @@ jobs:
             exit 1
           fi
       - name: Run tests before packaging
-        run: cargo test --release --locked ${{ matrix.features }}
-      - run: cargo build --release --locked ${{ matrix.features }}
+        run: cargo test --release --locked -p lattice-miner-gpu ${{ matrix.features }}
+      - run: cargo build --release --locked -p lattice-miner-gpu -p lattice-miner ${{ matrix.features }}
       - name: Package
         env:
           RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
@@ -76,7 +76,7 @@ jobs:
           set -euo pipefail
           bundle_name="lattice-miner-gpu-${RELEASE_VERSION}-${{ matrix.platform }}"
           mkdir -p "dist/$bundle_name/bin"
-          cp "target/release/lattice-miner-gpu${{ matrix.exe }}" "dist/$bundle_name/bin/"
+          cp "target/release/lattice-miner-gpu${{ matrix.exe }}" "target/release/lattice-miner${{ matrix.exe }}" "dist/$bundle_name/bin/"
           cp README.md LICENSE "dist/$bundle_name/"
           cd dist
           tar -czf "$bundle_name.tar.gz" "$bundle_name"
@@ -93,6 +93,7 @@ jobs:
           worker="$(echo extracted/*/bin/lattice-miner-gpu${{ matrix.exe }})"
           "$worker" --work-id cpu --prefix-hex deadbeef \
             --target "$(printf 'ff%.0s' {1..32})" --count 4 --backend cpu | grep -q '"status":"found"'
+          "$(echo extracted/*/bin/lattice-miner${{ matrix.exe }})" --version
       - uses: actions/upload-artifact@v4
         with:
           name: lattice-miner-gpu-${{ matrix.platform }}
@@ -120,5 +121,5 @@ jobs:
           sha256sum -c *.sha256
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "$TAG" \
-            --notes "lattice-miner-gpu $TAG prebuilt workers. See the README's Download section to verify and run them." \
+            --notes "lattice-miner $TAG: the miner (lattice-miner) and the worker (lattice-miner-gpu), prebuilt. See the README's Download section to verify and run them." \
             *

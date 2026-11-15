@@ -1,10 +1,11 @@
 #!/bin/sh
-# Self-starting merged miner (current lattice-node architecture): ONE
-# lattice-node process hosts Nexus plus the configured child levels under
-# `lattice up --foreground`, and mining runs through the reference
-# mine-supervisor once Nexus is synced. ONE CUDA solution advances Nexus AND
-# the hosted children (merged mining): the template from the Nexus RPC
-# carries every hosted level.
+# Self-starting merged miner: ONE lattice-node process hosts Nexus plus the
+# configured child levels under `lattice up --foreground`, and once Nexus is
+# synced `lattice-miner run` mines through it with the CUDA worker. The node
+# only serves templates and accepts work; the miner is a client of it with
+# its own settings ($DATA_DIR/miner.json, written from the environment at
+# every boot). ONE CUDA solution advances Nexus AND the hosted children
+# (merged mining): the template from the Nexus RPC carries every hosted level.
 #
 # Rewards: each block names its own reward recipient (`rewardRecipient`,
 # covered by the proof of work). The host holds no key and no pre-signed
@@ -24,7 +25,7 @@
 #                  to mine Nexus only
 #   WORKERS        GPU worker processes (default 1; one drives the whole GPU)
 #   BATCH_SIZE     nonce span per coordinator round (default 2_000_000_000)
-#   MINER_BACKEND  cuda|opencl|cpu for the worker shim (default cuda)
+#   MINER_BACKEND  cuda|opencl|cpu for the worker (default cuda)
 set -eu
 
 ROOT="${DATA_DIR:-/data}"
@@ -65,8 +66,20 @@ cat > "$ROOT/lattice.json" <<EOF
 }
 EOF
 
-# Bring-up runs beside the foreground supervisor: wait for the parent to
-# catch up to the network, then hand over to the reference mining supervisor.
+# The miner's own settings, rewritten every boot like lattice.json. It reads
+# them again before every round; the node never sees them.
+recipients_json="$(printf '%s' "$RECIPIENTS" | jq -R 'split(",") | map(select(length > 0) | split("=") | {(.[0]): (.[1:] | join("="))}) | add // {}')"
+jq -n \
+    --argjson recipients "$recipients_json" \
+    --argjson workers "$WORKERS" \
+    --argjson batch "$BATCH_SIZE" \
+    '{worker: "/usr/local/bin/lattice-miner-gpu", workers: $workers, batchSize: $batch, recipients: $recipients}' \
+    > "$ROOT/miner.json"
+# The worker reads its backend from the environment the miner passes on.
+export LATTICE_MINER_BACKEND="${MINER_BACKEND:-cuda}"
+
+# Bring-up runs beside the foreground node: wait for the parent to catch up
+# to the network, then start the miner.
 # Hosted children catch up in the background; they never block Nexus mining.
 (
     # Synced means CAUGHT UP TO THE NETWORK, not locally stable: a just-booted
@@ -92,16 +105,9 @@ EOF
     done
     echo "mining bring-up: Nexus caught up (height $height, network $network_height)."
 
-    echo "mining bring-up: starting the mining supervisor."
-    NODE_URL="$NEXUS_RPC" \
-    COOKIE_FILE="$COOKIE_FILE" \
-    COORDINATOR=/usr/local/bin/lattice-mining-coordinator \
-    WORKER=/usr/local/bin/lattice-cuda-worker \
-    WORKERS="$WORKERS" \
-    BATCH_SIZE="$BATCH_SIZE" \
-    RECIPIENTS="$RECIPIENTS" \
-    LOG_FILE="$ROOT/mining.log" \
-    exec python3 /usr/local/bin/mine-supervisor.py
+    echo "mining bring-up: starting lattice-miner (log $ROOT/mining.log)."
+    exec lattice-miner run --node "$NEXUS_RPC" --cookie-file "$COOKIE_FILE" \
+        --config "$ROOT/miner.json" >> "$ROOT/mining.log" 2>&1
 ) &
 
 exec lattice up --root "$ROOT" --foreground
