@@ -40,6 +40,23 @@ opencl3 = { version = "0.12", optional = true, default-features = false, feature
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.29"
 
+# The coordinator (`lattice-miner`) and the worker/coordinator contract
+# (`lattice-miner-core`) live beside this worker. A plain `cargo build` here
+# builds the worker only; `--workspace` builds all three.
+[workspace]
+members = [".", "coordinator"]
+resolver = "2"
+
+# lattice-rs and cashew-rs name their sibling repositories by relative path;
+# fetched as git dependencies those siblings come from their own repositories,
+# at the revisions lattice-rs pins (platform-revisions.json).
+[patch."https://github.com/0xLattice/lattice-rs"]
+lattice-cashew = { git = "https://github.com/0xLattice/cashew-rs", rev = "ba341b7af36e5769d4423cd486ae8f2ac81f9f0c" }
+lattice-multikey = { git = "https://github.com/0xLattice/multikey-rs", rev = "9f629d9844788f933ed730fa1e53e0c0fc00cd62" }
+
+[patch."https://github.com/0xLattice/cashew-rs"]
+lattice-array-trie = { git = "https://github.com/0xLattice/array-trie-rs", rev = "3ad1694289bdd9a95d5d81f546ca58ae8fc13c3a" }
+
 [profile.release]
 lto = true
 codegen-units = 1
