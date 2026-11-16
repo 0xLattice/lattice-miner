@@ -88,6 +88,14 @@ async fn stdout_flood_and_closed_stdout_bounded() {
     );
 }
 #[tokio::test]
+async fn a_result_written_before_cancellation_is_kept() {
+    // The worker writes its hit and has not exited when the search is
+    // cancelled: the hit is returned, not dropped.
+    let found = r#"print(json.dumps({'workId':'fixed','status':'found','nonce':0,'rangeStart':18446744073709551615,'rangeCount':2}));sys.stdout.close();os.close(1);time.sleep(10)"#;
+    let result = run_for(found, Some(Duration::from_secs(1))).await;
+    assert_eq!(result.unwrap().unwrap().nonce, 0);
+}
+#[tokio::test]
 async fn cancellation_kills_descendant_group() {
     let dir = tempfile::tempdir().unwrap();
     let pidfile = dir.path().join("pid");

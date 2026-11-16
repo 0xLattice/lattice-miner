@@ -71,11 +71,6 @@ impl NodeClient for Node {
                     disposition: "refused".into(),
                     tip_cid: None,
                 }),
-                5 => Ok(Submission {
-                    accepted: false,
-                    disposition: "unknownWork".into(),
-                    tip_cid: None,
-                }),
                 _ => Ok(Submission {
                     accepted: true,
                     disposition: "accepted".into(),
@@ -93,6 +88,8 @@ struct Searcher {
     fail: bool,
     none: bool,
     wrong: bool,
+    /// Holds its hit until the search is stopped.
+    hold: bool,
 }
 impl Worker for Searcher {
     fn id(&self) -> &str {
@@ -104,7 +101,7 @@ impl Worker for Searcher {
         r: NonceRange,
         cancel: CancellationToken,
     ) -> BoxFuture<'_, Result<Option<WorkerResult>, Error>> {
-        async move{self.assignments.lock().unwrap().push((w.work_id.clone(),w.target,r));tokio::select!{_=cancel.cancelled()=>return Ok(None),_=tokio::time::sleep(self.delay)=>{}}if self.fail{return Err(Error::Worker("fixture failure".into()));}
+        async move{self.assignments.lock().unwrap().push((w.work_id.clone(),w.target,r));tokio::select!{_=cancel.cancelled()=>if !self.hold{return Ok(None)},_=tokio::time::sleep(self.delay)=>{}}if self.fail{return Err(Error::Worker("fixture failure".into()));}
 if self.none{return Ok(None);}for i in 0..r.count {let nonce=r.start_nonce.wrapping_add(i);if lattice_pow::hash(&w.prefix,nonce)<=w.target{return Ok(Some(WorkerResult{worker_id:"test".into(),work_id:if self.wrong{"wrong".into()}else{w.work_id.clone()},nonce}));}}Ok(None)}.boxed()
     }
 }
@@ -216,17 +213,33 @@ async fn a_solution_found_after_the_tip_moved_is_submitted() {
         Cycle::Submitted { submission, .. } if submission.accepted
     ));
     assert_eq!(*n.submits.lock().unwrap(), vec![("one".to_string(), 0)]);
-    // The node forgot the work: an ordinary answer, counted, not retried.
+}
+#[tokio::test]
+async fn every_hit_of_a_batch_is_submitted_once() {
+    // Two workers each find a nonce in their own range; the first answer
+    // ends the search, and the other hit is still submitted.
     let n = Arc::new(Node::new(work()));
-    n.answers.lock().unwrap().push_back(5);
-    let mut c = Coordinator::new(n.clone(), vec![Arc::new(Searcher::default())], opts());
+    *n.answers.lock().unwrap() = VecDeque::from([4, 0]);
+    let mut c = Coordinator::new(
+        n.clone(),
+        vec![
+            Arc::new(Searcher::default()),
+            Arc::new(Searcher {
+                delay: Duration::from_secs(3600),
+                hold: true,
+                ..Default::default()
+            }),
+        ],
+        opts(),
+    );
+    // The accepted answer is the one reported.
     assert!(matches!(
         c.run_batch(&CancellationToken::new()).await,
-        Cycle::Submitted { submission, .. }
-            if !submission.accepted && submission.disposition == "unknownWork"
+        Cycle::Submitted { submission, .. } if submission.accepted
     ));
-    assert_eq!(n.submits.lock().unwrap().len(), 1);
-    assert_eq!(c.metrics().rejected_solution_count, 1);
+    let mut nonces: Vec<_> = n.submits.lock().unwrap().iter().map(|s| s.1).collect();
+    nonces.sort();
+    assert_eq!(nonces, vec![0, 10]);
 }
 #[tokio::test]
 async fn child_only_resumes_same_range_harder() {

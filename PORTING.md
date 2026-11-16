@@ -138,9 +138,7 @@ nonce when the tip has moved; here neither probe exists, and a search
 stopped because the work went stale still submits what it had found. Lattice
 state is immutable, so a block solved on an old tip is a valid side block
 whose work counts toward its subtree. The differential's `stale_retry` cycle
-asserts this instead of Swift's transcript. A node that forgot the work
-answers `unknownWork`: an ordinary non-accepted outcome, not a refusal, so the
-next round starts at once.
+asserts this instead of Swift's transcript.
 
 New: the one-batch CLI (`--once`, `--no-stale-probe`, flags per setting) is
 replaced by `lattice-miner run` and `miner.json`. A round that gets no

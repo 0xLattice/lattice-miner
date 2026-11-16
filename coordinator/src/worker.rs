@@ -161,24 +161,28 @@ impl Worker for ProcessWorker {
             let mut err = ReaderGuard(tokio::spawn(output(stderr, 4096, true)));
             // Work never expires on a clock: only cancellation (the work went
             // stale, or the batch ended) stops a search early.
+            // Once its output is complete, a cancelled worker's result is
+            // still read: a nonce found as the search stops is not dropped.
+            // `None` is a worker stopped after its output was complete.
             let mut early = None;
             let status = tokio::select! {
                 biased;
+                result = &mut out.0 => {
+                    early = Some(result.map_err(|e| Error::Worker(e.to_string()))??);
+                    tokio::select! {
+                        biased;
+                        s = child.wait() => Some(s?),
+                        _ = cancel.cancelled() => {
+                            let _ = child.kill().await;
+                            None
+                        }
+                    }
+                }
                 _ = cancel.cancelled() => {
                     let _ = child.kill().await;
                     return Ok(None);
                 }
-                result = &mut out.0 => {
-                    early = Some(result.map_err(|e| Error::Worker(e.to_string()))??);
-                    tokio::select! {
-                        _ = cancel.cancelled() => {
-                            let _ = child.kill().await;
-                            return Ok(None);
-                        }
-                        s = child.wait() => s?,
-                    }
-                }
-                s = child.wait() => s?,
+                s = child.wait() => Some(s?),
             };
             // The direct child may have left descendants holding pipe ends. Always tear
             // down its isolated process group before the bounded final drain.
@@ -195,18 +199,25 @@ impl Worker for ProcessWorker {
                 .await
                 .map_err(|_| Error::Worker("stderr drain deadline exceeded".into()))?
                 .map_err(|e| Error::Worker(e.to_string()))??;
-            if !status.success() {
+            if let Some(status) = status
+                && !status.success()
+            {
                 return Err(Error::Worker(format!(
                     "exit {status}: {}",
                     String::from_utf8_lossy(&stderr)
                 )));
             }
-            let result: WorkerOutput = serde_json::from_slice(&bytes).map_err(|_| {
-                Error::Worker(format!(
-                    "invalid worker JSON: {}",
-                    String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(4096)..])
-                ))
-            })?;
+            let result: WorkerOutput = match serde_json::from_slice(&bytes) {
+                Ok(result) => result,
+                // Stopped with no result written: nothing was found.
+                Err(_) if status.is_none() => return Ok(None),
+                Err(_) => {
+                    return Err(Error::Worker(format!(
+                        "invalid worker JSON: {}",
+                        String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(4096)..])
+                    )));
+                }
+            };
             if result.work_id != work.work_id
                 || result.range_start != range.start_nonce
                 || result.range_count != range.count

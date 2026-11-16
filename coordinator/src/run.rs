@@ -197,12 +197,6 @@ pub async fn run(options: RunOptions, cancel: CancellationToken) -> Result<(), S
                 log("accepted child block(s) (childOnly)");
                 Duration::ZERO
             }
-            Cycle::Submitted { submission, .. } if submission.disposition == "unknownWork" => {
-                // The node no longer holds the work the nonce was found on
-                // (its tip moved): an ordinary outcome, not a refusal.
-                log("submitted; the node no longer holds this round's work (unknownWork)");
-                Duration::ZERO
-            }
             Cycle::Submitted { submission, .. } => {
                 log(format!(
                     "the node refused this round's work ({}); retrying",
