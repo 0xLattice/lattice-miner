@@ -77,13 +77,16 @@ the last good settings are kept. Only a bad file at start is fatal.
 A round is one batch: fetch a template, search it, submit hits. A hit that
 clears only some of the template's targets (a child chain's, `childOnly`) is
 submitted and the search goes on over the same range toward the rest. Work is
-valid until the node's template digest changes: the miner follows
-`GET /mining/events` and ends a batch when a pushed digest differs from its
-work's. A dropped stream says nothing about the chain: the search goes on,
+searched until the node's template digest changes: the miner follows
+`GET /mining/events` and stops a batch's search when a pushed digest differs
+from its work's. A nonce already found is always submitted, even after the tip
+moved: a block solved on an old tip is still a valid block whose work counts.
+A dropped stream says nothing about the chain: the search goes on,
 `GET /status` is polled every 2 s meanwhile, and the stream is opened again
-after a wait doubling from 250 ms to 5 s. A round without a template, a refused
-submission or a failed worker is logged and retried after 5 s. SIGINT or
-SIGTERM ends the round in flight and exits; a submission already in flight
+after a wait doubling from 250 ms to 5 s. A submission that fails in transit
+(no answer, HTTP 5xx) is retried up to 3 times. A round without a template, a
+refused submission or a failed worker is logged and retried after 5 s. SIGINT
+or SIGTERM ends the round in flight and exits; a submission already in flight
 gets up to 10 s to be answered first. The recipients in effect are logged at
 start and whenever they change, with a warning when none are named or a
 template mines a chain with none. `lattice-miner check --config miner.json`

@@ -77,8 +77,9 @@ pub struct CoordinatorOptions {
     pub max_submit_retries: usize,
     /// The node's template digest as `GET /mining/events` pushes it
     /// ([`HttpNodeClient::digest_feed`]), `None` while not connected. While
-    /// connected, a pushed digest other than the work's ends the batch as
-    /// stale; while not, the status route is polled every `probe_interval`.
+    /// connected, a pushed digest other than the work's ends the batch's
+    /// search as stale; while not, the status route is polled every
+    /// `probe_interval`. A nonce already found is submitted either way.
     pub digests: Option<tokio::sync::watch::Receiver<Option<String>>>,
 }
 impl Default for CoordinatorOptions {
@@ -139,11 +140,6 @@ impl Coordinator {
     pub fn metrics(&self) -> &Metrics {
         &self.metrics
     }
-    /// Whether the node has moved on from `work`. Cancellation proves nothing
-    /// either way: a found nonce is still submitted, within [`SUBMIT_GRACE`].
-    async fn stale(&self, work: &Work, cancel: &CancellationToken) -> bool {
-        tokio::select! {biased;_=cancel.cancelled()=>false,result=self.node.stale_token()=>matches!(result,Ok(Some(token)) if token!=work.stale_token)}
-    }
     async fn submit_retry(
         &mut self,
         work: &Work,
@@ -199,12 +195,6 @@ impl Coordinator {
                     }
                     self.metrics.retry_backoff_count += 1;
                     tokio::select! {biased;_=cancel.cancelled()=>return Cycle::Cancelled,_=tokio::time::sleep(self.options.retry_delay)=>{}}
-                    if self.stale(work, cancel).await {
-                        self.metrics.stale_abort_count += 1;
-                        return Cycle::Stale {
-                            work_id: work.work_id.clone(),
-                        };
-                    }
                 }
             }
         }
@@ -304,16 +294,27 @@ impl Coordinator {
             );
         }
         let mut open = work.targets.first().copied();
-        let mut last_child = None;
-        while searching > 0 || probing {
+        // What the batch reports: the first submission, unless a later one
+        // is accepted.
+        let mut outcome: Option<Cycle> = None;
+        let mut stale = false;
+        // `child` is cancelled once the work is stale or a hit needs no more
+        // search; the searches still running then end, and every hit they
+        // return is submitted.
+        while searching > 0 || (probing && !child.is_cancelled()) {
             let event = tokio::select! {biased;_=cancel.cancelled()=>return Cycle::Cancelled,e=tasks.next()=>match e{Some(e)=>e,None=>break}};
             match event {
                 BatchEvent::Fresh => probing = false,
                 BatchEvent::Stale => {
-                    self.metrics.stale_abort_count += 1;
-                    return Cycle::Stale {
-                        work_id: work.work_id.clone(),
-                    };
+                    // The node moved on: stop searching this work. A nonce
+                    // already found is still submitted as the searches end:
+                    // a block solved on an old tip is a valid side block
+                    // whose work counts.
+                    if !stale {
+                        stale = true;
+                        self.metrics.stale_abort_count += 1;
+                        child.cancel();
+                    }
                 }
                 BatchEvent::Search(i, range, result) => {
                     searching -= 1;
@@ -333,29 +334,32 @@ impl Coordinator {
                         .then(|| lattice_pow::hash(&work.prefix, result.nonce));
                     let cleared = matches!((hash,open,work.targets.first()),(Some(h),Some(o),Some(t)) if h>o&&h<=*t);
                     if !cleared {
-                        if self.options.stale_probe && self.stale(&work, cancel).await {
-                            self.metrics.stale_abort_count += 1;
-                            return Cycle::Stale {
-                                work_id: work.work_id.clone(),
-                            };
-                        }
-                        let outcome = self.submit_retry(&work, result.clone(), cancel).await;
-                        match (&outcome, hash) {
-                            (Cycle::Submitted { submission, .. }, Some(hash))
+                        let submitted = self.submit_retry(&work, result.clone(), cancel).await;
+                        let Cycle::Submitted { submission, .. } = &submitted else {
+                            return submitted;
+                        };
+                        // A child-only hit searches on toward the harder
+                        // targets it missed; any other ends the search.
+                        let harder = match hash {
+                            Some(hash)
                                 if !submission.accepted
                                     && submission.disposition == "childOnly" =>
                             {
-                                let Some(next) = work.targets.iter().find(|t| **t < hash) else {
-                                    return outcome;
-                                };
-                                open = Some(*next);
-                                last_child = Some(outcome);
+                                work.targets.iter().find(|t| **t < hash).copied()
                             }
-                            _ => return outcome,
+                            _ => None,
+                        };
+                        match harder {
+                            Some(target) => open = Some(target),
+                            None => child.cancel(),
+                        }
+                        if outcome.is_none() || submission.accepted {
+                            outcome = Some(submitted);
                         }
                     }
                     let searched = result.nonce.wrapping_sub(range.start_nonce);
-                    if let Some(target) = open
+                    if !child.is_cancelled()
+                        && let Some(target) = open
                         && searched < range.count
                         && range.count - searched > 1
                     {
@@ -371,8 +375,11 @@ impl Coordinator {
                 }
             }
         }
-        last_child.unwrap_or_else(|| Cycle::NoSolution {
-            work_id: work.work_id.clone(),
+        let work_id = work.work_id.clone();
+        outcome.unwrap_or(if stale {
+            Cycle::Stale { work_id }
+        } else {
+            Cycle::NoSolution { work_id }
         })
     }
 }

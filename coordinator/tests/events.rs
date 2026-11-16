@@ -118,9 +118,10 @@ fn work() -> Work {
 }
 
 /// A node whose status route always answers the work's digest, so only a
-/// push can make work stale.
+/// push can make work stale. It accepts every submission.
 struct Node {
     status_reads: AtomicUsize,
+    submits: Mutex<Vec<u64>>,
 }
 impl NodeClient for Node {
     fn fetch_work(&self) -> BoxFuture<'_, Result<Option<Work>, Error>> {
@@ -130,8 +131,16 @@ impl NodeClient for Node {
         self.status_reads.fetch_add(1, Ordering::SeqCst);
         async { Ok(Some("d1".into())) }.boxed()
     }
-    fn submit(&self, _: String, _: u64) -> BoxFuture<'_, Result<Submission, Error>> {
-        async { panic!("nothing is found") }.boxed()
+    fn submit(&self, _: String, nonce: u64) -> BoxFuture<'_, Result<Submission, Error>> {
+        self.submits.lock().unwrap().push(nonce);
+        async {
+            Ok(Submission {
+                accepted: true,
+                disposition: "acceptedSide".into(),
+                tip_cid: None,
+            })
+        }
+        .boxed()
     }
 }
 
@@ -160,6 +169,7 @@ async fn a_pushed_digest_ends_the_batch_and_a_disconnect_does_not() {
     let (tx, rx) = watch::channel(Some("d1".to_string()));
     let node = Arc::new(Node {
         status_reads: AtomicUsize::new(0),
+        submits: Mutex::new(vec![]),
     });
     let mut coordinator = Coordinator::new(
         node.clone(),
@@ -199,4 +209,66 @@ async fn a_pushed_digest_ends_the_batch_and_a_disconnect_does_not() {
     assert_eq!(coordinator.metrics().stale_abort_count, 1);
     // One status read: the batch's first freshness probe. The rest was pushed.
     assert_eq!(node.status_reads.load(Ordering::SeqCst), 1);
+    assert!(node.submits.lock().unwrap().is_empty());
+}
+
+/// Holds the nonce it found until the search is stopped: the hit and the
+/// tip move land together.
+struct FoundAsStopped;
+impl Worker for FoundAsStopped {
+    fn id(&self) -> &str {
+        "found"
+    }
+    fn search(
+        &self,
+        work: Arc<Work>,
+        range: NonceRange,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'_, Result<Option<WorkerResult>, Error>> {
+        async move {
+            cancel.cancelled().await;
+            Ok(Some(WorkerResult {
+                worker_id: "found".into(),
+                work_id: work.work_id.clone(),
+                nonce: range.start_nonce,
+            }))
+        }
+        .boxed()
+    }
+}
+
+#[tokio::test]
+async fn a_pushed_digest_stops_the_search_but_a_found_nonce_is_submitted() {
+    let (tx, rx) = watch::channel(Some("d1".to_string()));
+    let node = Arc::new(Node {
+        status_reads: AtomicUsize::new(0),
+        submits: Mutex::new(vec![]),
+    });
+    let mut coordinator = Coordinator::new(
+        node.clone(),
+        vec![Arc::new(FoundAsStopped), Arc::new(Endless)],
+        CoordinatorOptions {
+            total_batch_size: 20,
+            probe_interval: Duration::from_secs(3600),
+            retry_delay: Duration::ZERO,
+            digests: Some(rx),
+            ..Default::default()
+        },
+    );
+    let batch = tokio::spawn(async move {
+        let cycle = coordinator.run_batch(&CancellationToken::new()).await;
+        (coordinator, cycle)
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    tx.send_replace(Some("d2".into()));
+    let (coordinator, cycle) = tokio::time::timeout(Duration::from_secs(2), batch)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&cycle, Cycle::Submitted { nonce: 0, submission, .. } if submission.accepted),
+        "{cycle:?}"
+    );
+    assert_eq!(*node.submits.lock().unwrap(), vec![0]);
+    assert_eq!(coordinator.metrics().stale_abort_count, 1);
 }
