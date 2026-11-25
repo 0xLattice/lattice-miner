@@ -6,8 +6,8 @@ on:
   pull_request:
 
 jobs:
-  # The miner (coordinator, round loop) and the worker contract they share,
-  # including the differential test against the Swift coordinator's vectors.
+  # The miner (coordinator, streaming session) and the worker contract they
+  # share.
   miner:
     runs-on: ubuntu-latest
     steps:

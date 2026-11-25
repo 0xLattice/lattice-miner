@@ -142,9 +142,3 @@ pub struct Submission {
     #[serde(rename = "tipCID", skip_serializing_if = "Option::is_none")]
     pub tip_cid: Option<String>,
 }
-#[derive(Debug, Clone)]
-pub struct WorkerResult {
-    pub worker_id: String,
-    pub work_id: String,
-    pub nonce: u64,
-}

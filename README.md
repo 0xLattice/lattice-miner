@@ -6,7 +6,7 @@ mines lives here:
 
 | Crate | Binary | What it is |
 | --- | --- | --- |
-| [`coordinator/`](coordinator) | `lattice-miner` | The miner: a client of one node. It fetches templates, splits nonce ranges across workers, follows the node's template digest, submits what is found, and runs the rounds. |
+| [`coordinator/`](coordinator) | `lattice-miner` | The miner: a client of one node. It fetches templates, splits nonce ranges across workers, follows the node's template digest, submits every hit, and keeps each worker searching the current template. |
 | `.` (root) | `lattice-miner-gpu` | The worker: CPU, Metal, CUDA and OpenCL nonce search. |
 | [`core/`](core) | | The worker contract both sides share: target spelling, nonce ranges, the worker's result. |
 

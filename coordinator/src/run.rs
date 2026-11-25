@@ -80,12 +80,11 @@ fn log_submitted(work_id: &str, nonce: u64, result: &Result<Submission, Error>) 
 /// The workers a configuration names.
 fn workers(config: &MinerConfig) -> Vec<Arc<dyn StreamWorker>> {
     (0..config.workers())
-        .map(|i| match config.worker.as_deref() {
+        .map(|_| match config.worker.as_deref() {
             Some(path) if path != "cpu" => {
-                Arc::new(ProcessWorker::new(format!("worker-{i}"), path.into()))
-                    as Arc<dyn StreamWorker>
+                Arc::new(ProcessWorker::new(path.into())) as Arc<dyn StreamWorker>
             }
-            _ => Arc::new(CpuWorker::new(format!("cpu-{i}"))) as Arc<dyn StreamWorker>,
+            _ => Arc::new(CpuWorker) as Arc<dyn StreamWorker>,
         })
         .collect()
 }

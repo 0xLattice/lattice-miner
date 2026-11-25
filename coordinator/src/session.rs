@@ -26,6 +26,13 @@ pub struct Job {
     pub start_nonce: u64,
 }
 
+/// The node the session mines through.
+pub trait NodeClient: Send + Sync + 'static {
+    fn fetch_work(&self) -> BoxFuture<'_, Result<Option<Work>, Error>>;
+    fn stale_token(&self) -> BoxFuture<'_, Result<Option<String>, Error>>;
+    fn submit(&self, work_id: String, nonce: u64) -> BoxFuture<'_, Result<Submission, Error>>;
+}
+
 /// A worker that runs for a whole session.
 pub trait StreamWorker: Send + Sync + 'static {
     /// Searches each job `jobs` brings, sending every hit to `hits`, until

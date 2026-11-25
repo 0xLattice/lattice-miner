@@ -455,7 +455,7 @@ for line in sys.stdin:
     let found: Vec<String> = (0..3)
         .map(|i| nonce("w1", HARD, EASY, i).to_string())
         .collect();
-    let mut worker = ProcessWorker::new("p", "python3".into());
+    let mut worker = ProcessWorker::new("python3".into());
     worker.arguments = vec![
         script.to_string_lossy().into_owned(),
         seen.to_string_lossy().into_owned(),
@@ -580,7 +580,7 @@ async fn finishing_submits_every_hit_already_found() {
 async fn the_cpu_worker_idles_on_a_zero_target() {
     let (jobs, receiver) = mpsc::unbounded_channel();
     let (sender, mut hits) = mpsc::unbounded_channel();
-    let stream = CpuWorker::new("cpu").stream(receiver, sender);
+    let stream = CpuWorker.stream(receiver, sender);
     let task = tokio::spawn(stream);
     let w1 = Arc::new(work("w1", "d1"));
     let job = |target| Job {

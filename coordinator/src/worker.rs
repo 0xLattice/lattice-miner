@@ -1,71 +1,20 @@
 use crate::*;
 use futures_util::{FutureExt, future::BoxFuture};
 use sha2::{Digest, Sha256};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, time::Duration};
 use tokio::{io::AsyncReadExt, process::Command};
-use tokio_util::sync::CancellationToken;
-pub struct CpuWorker {
-    id: String,
-}
-impl CpuWorker {
-    pub fn new(id: impl Into<String>) -> Self {
-        Self { id: id.into() }
-    }
-}
-impl Worker for CpuWorker {
-    fn id(&self) -> &str {
-        &self.id
-    }
-    fn search(
-        &self,
-        work: Arc<Work>,
-        range: NonceRange,
-        cancel: CancellationToken,
-    ) -> BoxFuture<'_, Result<Option<WorkerResult>, Error>> {
-        let id = self.id.clone();
-        async move {
-            let bytes = hex::decode(&work.block_hex).map_err(|e| Error::Worker(e.to_string()))?;
-            let block: lattice_primitives::Block = lattice_cashew::cbor::decode(&bytes)?;
-            let prefix = block.pow_prefix();
-            tokio::task::spawn_blocking(move || {
-                let mut base = Sha256::new();
-                base.update(prefix);
-                for offset in 0..range.count {
-                    let nonce = range.start_nonce.wrapping_add(offset);
-                    if offset & 1023 == 0 && cancel.is_cancelled() {
-                        return None;
-                    }
-                    let mut h = base.clone();
-                    h.update(nonce.to_be_bytes());
-                    let hash: [u8; 32] = h.finalize().into();
-                    if hash <= work.target {
-                        return Some(WorkerResult {
-                            worker_id: id,
-                            work_id: work.work_id.clone(),
-                            nonce,
-                        });
-                    }
-                }
-                None
-            })
-            .await
-            .map_err(|e| Error::Worker(e.to_string()))
-        }
-        .boxed()
-    }
-}
+/// The built-in search, on one CPU thread.
+pub struct CpuWorker;
 #[derive(Clone)]
 pub struct ProcessWorker {
-    id: String,
     pub executable: PathBuf,
     pub arguments: Vec<String>,
     pub maximum_stdout: usize,
     pub drain_timeout: Duration,
 }
 impl ProcessWorker {
-    pub fn new(id: impl Into<String>, executable: PathBuf) -> Self {
+    pub fn new(executable: PathBuf) -> Self {
         Self {
-            id: id.into(),
             executable,
             arguments: vec![],
             maximum_stdout: 64 * 1024,
@@ -113,143 +62,6 @@ async fn output(
             }
             out.extend_from_slice(&chunk[..n]);
         }
-    }
-}
-impl Worker for ProcessWorker {
-    fn id(&self) -> &str {
-        &self.id
-    }
-    fn search(
-        &self,
-        work: Arc<Work>,
-        range: NonceRange,
-        cancel: CancellationToken,
-    ) -> BoxFuture<'_, Result<Option<WorkerResult>, Error>> {
-        async move {
-            let mut command = Command::new(&self.executable);
-            command.args(&self.arguments).args([
-                "--work-id",
-                &work.work_id,
-                "--block-hex",
-                &work.block_hex,
-                "--target",
-                &hex::encode(work.target),
-                "--start-nonce",
-                &range.start_nonce.to_string(),
-                "--count",
-                &range.count.to_string(),
-            ]);
-            if !work.prefix.is_empty() {
-                command.args(["--prefix-hex", &hex::encode(&work.prefix)]);
-            }
-            command
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .kill_on_drop(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                command.as_std_mut().process_group(0);
-            }
-            let mut child = command.spawn()?;
-            #[cfg(unix)]
-            let group = GroupGuard(child.id().expect("spawned PID") as i32);
-            let stdout = child.stdout.take().unwrap();
-            let stderr = child.stderr.take().unwrap();
-            let mut out = ReaderGuard(tokio::spawn(output(stdout, self.maximum_stdout, false)));
-            let mut err = ReaderGuard(tokio::spawn(output(stderr, 4096, true)));
-            // Work never expires on a clock: only cancellation (the work went
-            // stale, or the batch ended) stops a search early.
-            // Once its output is complete, a cancelled worker's result is
-            // still read: a nonce found as the search stops is not dropped.
-            // `None` is a worker stopped after its output was complete.
-            let mut early = None;
-            let status = tokio::select! {
-                biased;
-                result = &mut out.0 => {
-                    early = Some(result.map_err(|e| Error::Worker(e.to_string()))??);
-                    tokio::select! {
-                        biased;
-                        s = child.wait() => Some(s?),
-                        _ = cancel.cancelled() => {
-                            let _ = child.kill().await;
-                            None
-                        }
-                    }
-                }
-                _ = cancel.cancelled() => {
-                    let _ = child.kill().await;
-                    return Ok(None);
-                }
-                s = child.wait() => Some(s?),
-            };
-            // The direct child may have left descendants holding pipe ends. Always tear
-            // down its isolated process group before the bounded final drain.
-            #[cfg(unix)]
-            drop(group);
-            let bytes = match early {
-                Some(bytes) => bytes,
-                None => tokio::time::timeout(self.drain_timeout, &mut out.0)
-                    .await
-                    .map_err(|_| Error::Worker("stdout drain deadline exceeded".into()))?
-                    .map_err(|e| Error::Worker(e.to_string()))??,
-            };
-            let stderr = tokio::time::timeout(self.drain_timeout, &mut err.0)
-                .await
-                .map_err(|_| Error::Worker("stderr drain deadline exceeded".into()))?
-                .map_err(|e| Error::Worker(e.to_string()))??;
-            if let Some(status) = status
-                && !status.success()
-            {
-                return Err(Error::Worker(format!(
-                    "exit {status}: {}",
-                    String::from_utf8_lossy(&stderr)
-                )));
-            }
-            let result: WorkerOutput = match serde_json::from_slice(&bytes) {
-                Ok(result) => result,
-                // Stopped with no result written: nothing was found.
-                Err(_) if status.is_none() => return Ok(None),
-                Err(_) => {
-                    return Err(Error::Worker(format!(
-                        "invalid worker JSON: {}",
-                        String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(4096)..])
-                    )));
-                }
-            };
-            if result.work_id != work.work_id
-                || result.range_start != range.start_nonce
-                || result.range_count != range.count
-            {
-                return Err(Error::Worker(
-                    "worker assignment identity/range mismatch".into(),
-                ));
-            }
-            match result.status.as_str() {
-                "found" => {
-                    let nonce = result
-                        .nonce
-                        .ok_or_else(|| Error::Worker("found without nonce".into()))?;
-                    if !range.contains(nonce) {
-                        return Err(Error::Worker("nonce outside assignment".into()));
-                    }
-                    Ok(Some(WorkerResult {
-                        worker_id: self.id.clone(),
-                        work_id: result.work_id,
-                        nonce,
-                    }))
-                }
-                "exhausted" => {
-                    if result.nonce.is_some() {
-                        return Err(Error::Worker("exhausted with nonce".into()));
-                    }
-                    Ok(None)
-                }
-                _ => Err(Error::Worker("unknown worker status".into())),
-            }
-        }
-        .boxed()
     }
 }
 
