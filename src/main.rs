@@ -159,13 +159,14 @@ fn search_cpu(prefix: &[u8], target: &[u8; 32], start: u64, count: u64) -> Optio
 const GPU_CHUNK: u64 = 16_000_000;
 const CPU_CHUNK: u64 = 1 << 16;
 
-/// A job in stream mode: where its search is, and where its chunk ends.
+/// A job in stream mode: where its search is, and how far the next goes.
 struct Job {
     work_id: String,
     prefix: Vec<u8>,
     target: [u8; 32],
     nonce: u64,
-    end: u64,
+    /// The nonces the next search covers.
+    span: u64,
 }
 
 fn fail(code: i32, message: &str) -> ! {
@@ -178,7 +179,7 @@ fn fail(code: i32, message: &str) -> ! {
 /// when stdin closes.
 fn stream(
     chunk: u64,
-    mut search: impl FnMut(&[u8], &[u8; 32], u64, u64) -> Result<Option<(u64, [u8; 32])>, String>,
+    search: impl FnMut(&[u8], &[u8; 32], u64, u64) -> Result<Option<(u64, [u8; 32])>, String>,
 ) {
     let (lines, jobs) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -189,7 +190,20 @@ fn stream(
             }
         }
     });
-    let mut stdout = std::io::stdout().lock();
+    serve(chunk, jobs, std::io::stdout().lock(), search);
+}
+
+/// Searches the jobs `jobs` brings, printing every hit to `stdout`, until
+/// `jobs` or `stdout` closes. A GPU search hashes every nonce it is given
+/// even past its first hit, so a search after a hit covers about twice the
+/// distance that hit was found at, not the rest of a chunk; a search that
+/// finds nothing doubles the next, up to `chunk`.
+fn serve(
+    chunk: u64,
+    jobs: std::sync::mpsc::Receiver<String>,
+    mut stdout: impl Write,
+    mut search: impl FnMut(&[u8], &[u8; 32], u64, u64) -> Result<Option<(u64, [u8; 32])>, String>,
+) {
     let mut job: Option<Job> = None;
     loop {
         // Every job sent since the last hit or chunk; with nothing to
@@ -215,7 +229,10 @@ fn stream(
             let target = parse_target(&next.target)
                 .unwrap_or_else(|| fail(2, &format!("invalid target in job {}", next.work_id)));
             match job.as_mut() {
-                Some(current) if current.work_id == next.work_id => current.target = target,
+                Some(current) if current.work_id == next.work_id => {
+                    current.target = target;
+                    current.span = chunk;
+                }
                 _ => {
                     let hex = next
                         .prefix_hex
@@ -229,27 +246,27 @@ fn stream(
                         prefix,
                         target,
                         nonce: next.start_nonce,
-                        end: next.start_nonce,
+                        span: chunk,
                     });
                 }
             }
         }
         let current = job.as_mut().expect("a job to search");
-        if current.nonce == current.end {
-            current.end = current.nonce.wrapping_add(chunk);
-        }
         let found = search(
             &current.prefix,
             &current.target,
             current.nonce,
-            current.end.wrapping_sub(current.nonce),
+            current.span,
         )
         .unwrap_or_else(|e| fail(1, &format!("backend failed: {e}")));
         let Some((nonce, digest)) = found else {
-            current.nonce = current.end;
+            current.nonce = current.nonce.wrapping_add(current.span);
+            current.span = current.span.saturating_mul(2).min(chunk);
             continue;
         };
+        let distance = nonce.wrapping_sub(current.nonce) + 1;
         current.nonce = nonce.wrapping_add(1);
+        current.span = distance.saturating_mul(2).min(chunk);
         let hit = StreamHit {
             work_id: current.work_id.clone(),
             nonce,
@@ -387,6 +404,45 @@ fn main() {
     };
 
     println!("{}", serde_json::to_string(&result).unwrap());
+}
+
+#[cfg(test)]
+mod serve_tests {
+    use super::*;
+
+    /// Like a GPU, the search hashes every nonce it is given: hits every
+    /// 1,000 nonces cost about as much as the nonces they cover.
+    #[test]
+    fn hits_found_close_together_are_not_paid_for_with_whole_chunks() {
+        struct Lines(usize);
+        impl Write for Lines {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 += bytes.iter().filter(|b| **b == b'\n').count();
+                if self.0 > 200 {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (send, jobs) = std::sync::mpsc::channel();
+        send.send(r#"{"workId":"a","prefixHex":"00","target":"ff","startNonce":0}"#.into())
+            .unwrap();
+        let (mut hashed, mut last) = (0u64, 0u64);
+        serve(GPU_CHUNK, jobs, Lines(0), |_, _, start, count| {
+            hashed += count;
+            let hit = start.div_ceil(1000) * 1000;
+            Ok((hit < start + count).then(|| {
+                last = hit;
+                (hit, [0; 32])
+            }))
+        });
+        assert_eq!(last, 200_000);
+        // The first search knows nothing and covers a whole chunk.
+        assert!(hashed < GPU_CHUNK + 4 * last, "hashed {hashed}");
+    }
 }
 
 #[cfg(test)]
