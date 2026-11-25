@@ -121,8 +121,9 @@ per line on stdin and prints one JSON line per winning nonce, lowest first:
 A job with a new `workId` starts a search at its `startNonce`; the same
 `workId` again changes only the target, and the search goes on from where it
 is. A job sent while searching takes effect at the next hit or the next chunk
-of nonces (16 M on a GPU, one kernel launch), whichever comes first. Every
-backend supports it.
+of nonces (16 M on a GPU, one kernel launch), whichever comes first. A target
+of zero, which no hash meets, idles the worker where it is until the next job.
+Every backend supports it.
 
 ## Status
 

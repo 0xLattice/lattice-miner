@@ -63,7 +63,8 @@ struct Args {
     /// first, searching on until stdin closes. A job with a new `workId`
     /// starts a search at its `startNonce`; the same `workId` again changes
     /// only the target and keeps the position. A job sent while searching
-    /// takes effect at the next hit or chunk of nonces.
+    /// takes effect at the next hit or chunk of nonces. A target of zero,
+    /// which no hash meets, idles the worker where it is until the next job.
     #[arg(long, conflicts_with_all = ["work_id", "prefix_hex", "block_hex", "target", "start_nonce", "count"])]
     stream: bool,
 
@@ -192,10 +193,14 @@ fn stream(
     let mut job: Option<Job> = None;
     loop {
         // Every job sent since the last hit or chunk; with nothing to
-        // search, wait.
+        // search, or a zero target that nothing meets, wait.
         loop {
-            let line = match job {
+            let line = match &job {
                 None => match jobs.recv() {
+                    Ok(line) => line,
+                    Err(_) => return,
+                },
+                Some(idle) if idle.target == [0; 32] => match jobs.recv() {
                     Ok(line) => line,
                     Err(_) => return,
                 },
