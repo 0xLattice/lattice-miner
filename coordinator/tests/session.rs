@@ -97,11 +97,23 @@ impl NodeClient for Node {
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.most_in_flight.fetch_max(now, Ordering::SeqCst);
             self.submits.lock().unwrap().push((id, nonce));
-            if self
-                .failing_submits
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_ok()
-            {
+            // Takes one failure, if any are left.
+            let mut left = self.failing_submits.load(Ordering::SeqCst);
+            let fail = loop {
+                if left == 0 {
+                    break false;
+                }
+                match self.failing_submits.compare_exchange(
+                    left,
+                    left - 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break true,
+                    Err(now) => left = now,
+                }
+            };
+            if fail {
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 self.in_flight.fetch_sub(1, Ordering::SeqCst);
                 return Err(Error::Timeout);
