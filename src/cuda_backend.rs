@@ -135,6 +135,20 @@ pub struct Searcher {
     dev: Arc<CudaDevice>,
     func: CudaFunction,
     found: CudaSlice<u32>,
+    /// The device inputs of the last search, kept while the prefix and the
+    /// target stay the same: a stream searches one job chunk after chunk.
+    inputs: Option<Inputs>,
+}
+
+struct Inputs {
+    prefix: Vec<u8>,
+    target: [u8; 32],
+    ms: Midstate,
+    num_blocks: u32,
+    nonce_off: u32,
+    ms_dev: CudaSlice<u32>,
+    region_dev: CudaSlice<u32>,
+    tgt_dev: CudaSlice<u32>,
 }
 
 impl Searcher {
@@ -147,7 +161,12 @@ impl Searcher {
         let found = dev
             .htod_copy(vec![u32::MAX])
             .map_err(|e| format!("htod found: {e}"))?;
-        Ok(Self { dev, func, found })
+        Ok(Self {
+            dev,
+            func,
+            found,
+            inputs: None,
+        })
     }
 
     /// The first winning `(nonce, digest)` in `[start, start+count)`, or `None`.
@@ -162,13 +181,7 @@ impl Searcher {
     }
 }
 
-fn run(
-    searcher: &mut Searcher,
-    prefix: &[u8],
-    target: &[u8; 32],
-    start: u64,
-    count: u64,
-) -> Result<Option<(u64, [u8; 32])>, String> {
+fn upload(dev: &Arc<CudaDevice>, prefix: &[u8], target: &[u8; 32]) -> Result<Inputs, String> {
     let ms = sha256::midstate_for_prefix(prefix);
     let (region_words, num_blocks, nonce_off) = region_words_for(&ms);
 
@@ -182,17 +195,56 @@ fn run(
         ]);
     }
 
-    let Searcher { dev, func, found } = searcher;
-
     let ms_dev = dev
         .htod_copy(ms.state.to_vec())
         .map_err(|e| format!("htod ms: {e}"))?;
     let region_dev = dev
-        .htod_copy(region_words.clone())
+        .htod_copy(region_words)
         .map_err(|e| format!("htod region: {e}"))?;
     let tgt_dev = dev
         .htod_copy(tgt.to_vec())
         .map_err(|e| format!("htod tgt: {e}"))?;
+    Ok(Inputs {
+        prefix: prefix.to_vec(),
+        target: *target,
+        ms,
+        num_blocks,
+        nonce_off,
+        ms_dev,
+        region_dev,
+        tgt_dev,
+    })
+}
+
+fn run(
+    searcher: &mut Searcher,
+    prefix: &[u8],
+    target: &[u8; 32],
+    start: u64,
+    count: u64,
+) -> Result<Option<(u64, [u8; 32])>, String> {
+    let Searcher {
+        dev,
+        func,
+        found,
+        inputs,
+    } = searcher;
+    if inputs
+        .as_ref()
+        .is_none_or(|i| i.prefix != prefix || i.target != *target)
+    {
+        *inputs = Some(upload(dev, prefix, target)?);
+    }
+    let Inputs {
+        ms,
+        num_blocks,
+        nonce_off,
+        ms_dev,
+        region_dev,
+        tgt_dev,
+        ..
+    } = inputs.as_ref().expect("uploaded above");
+    let (ms, num_blocks, nonce_off) = (ms, *num_blocks, *nonce_off);
 
     let block = 256u32;
     let chunk: u64 = 16_000_000;
@@ -213,14 +265,7 @@ fn run(
                 .launch(
                     cfg,
                     (
-                        &ms_dev,
-                        &region_dev,
-                        num_blocks,
-                        nonce_off,
-                        base,
-                        n,
-                        &tgt_dev,
-                        &*found,
+                        ms_dev, region_dev, num_blocks, nonce_off, base, n, tgt_dev, &*found,
                     ),
                 )
                 .map_err(|e| format!("launch: {e}"))?;
@@ -230,7 +275,7 @@ fn run(
             .map_err(|e| format!("dtoh found: {e}"))?[0];
         if gid != u32::MAX {
             let nonce = base.wrapping_add(gid as u64);
-            let hash = sha256::finalize_from_midstate(&ms, nonce);
+            let hash = sha256::finalize_from_midstate(ms, nonce);
             assert!(
                 crate::meets_target(&hash, target),
                 "CUDA reported a nonce whose hash exceeds target — kernel bug"
@@ -279,5 +324,13 @@ mod tests {
             Ok(crate::search_cpu(b"lattice", &target, start, count))
         );
         assert_eq!(searcher.search(b"lattice", &[0; 32], 0, 100_000), Ok(None));
+        // Back to an earlier prefix and target: the inputs kept for the last
+        // search are replaced, not reused.
+        let mut easy = [0xff_u8; 32];
+        easy[..2].fill(0);
+        assert_eq!(
+            searcher.search(&[], &easy, 0, 300_000),
+            Ok(crate::search_cpu(&[], &easy, 0, 300_000))
+        );
     }
 }
