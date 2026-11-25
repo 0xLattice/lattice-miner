@@ -186,6 +186,42 @@ mod stream {
     }
 
     #[test]
+    fn a_zero_target_idles_the_work_where_it_is() {
+        let (mut child, out) = spawn();
+        let p = [("a", "deadbeef")];
+        // Lines as they come, so a quiet worker can be told from a busy one.
+        let (lines, printed) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut out = out;
+            while let Some(hit) = next(&mut out, &p) {
+                if lines.send(hit.1).is_err() {
+                    break;
+                }
+            }
+        });
+        let wait = std::time::Duration::from_millis(300);
+        send(&mut child, "a", "deadbeef", HALF, 0);
+        let mut seen = vec![printed.recv().unwrap()];
+        send(&mut child, "a", "deadbeef", &"0".repeat(64), 0);
+        // What was found before the zero target took effect, then nothing.
+        while let Ok(nonce) = printed.recv_timeout(wait) {
+            seen.push(nonce);
+        }
+        send(&mut child, "a", "deadbeef", HALF, 0);
+        for _ in 0..20 {
+            seen.push(printed.recv().unwrap());
+        }
+        drop(child.stdin.take());
+        while let Ok(nonce) = printed.recv() {
+            seen.push(nonce);
+        }
+        reader.join().unwrap();
+        assert!(child.wait().unwrap().success());
+        // Idle searched nothing: the hits go on from where they stopped.
+        assert_eq!(seen, hits("deadbeef", HALF, 0, seen.last().unwrap() + 1));
+    }
+
+    #[test]
     fn no_job_then_eof_exits_cleanly_and_a_bad_job_is_refused() {
         let (child, out) = spawn();
         assert!(finish(child, out, &[]).is_empty());

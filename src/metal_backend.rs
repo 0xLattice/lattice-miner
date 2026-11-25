@@ -173,7 +173,10 @@ impl Searcher {
         start: u64,
         count: u64,
     ) -> Result<Option<(u64, [u8; 32])>, String> {
-        search(self, prefix, target, start, count)
+        // The command buffers and encoders a search makes are autoreleased:
+        // in a process that searches for as long as it runs, each search
+        // drains its own.
+        metal::objc::rc::autoreleasepool(|| search(self, prefix, target, start, count))
     }
 }
 
@@ -270,4 +273,34 @@ fn search(
         remaining -= n;
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resident_kb() -> u64 {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+    }
+
+    /// A streaming worker searches for as long as it runs: one `Searcher`
+    /// searching again and again must not grow.
+    #[test]
+    #[ignore = "requires an available Metal device"]
+    fn one_searcher_searching_again_and_again_stays_flat() {
+        let mut searcher = Searcher::new().unwrap();
+        for _ in 0..2_000 {
+            searcher.search(b"lattice", &[0; 32], 0, 256).unwrap();
+        }
+        let before = resident_kb();
+        for _ in 0..20_000 {
+            searcher.search(b"lattice", &[0; 32], 0, 256).unwrap();
+        }
+        let grown = resident_kb().saturating_sub(before);
+        assert!(grown < 4_096, "grew {grown} KB over 20,000 searches");
+    }
 }
