@@ -45,6 +45,38 @@ fn log_recipients(recipients: &Option<BTreeMap<String, String>>) {
     }
 }
 
+/// Says what a submission was answered; true for an accepted block.
+fn log_submitted(work_id: &str, nonce: u64, result: &Result<Submission, Error>) -> bool {
+    match result {
+        Ok(Submission {
+            accepted: true,
+            tip_cid,
+            ..
+        }) => {
+            log(format!(
+                "accepted tip={}",
+                tip_cid.as_deref().unwrap_or_default()
+            ));
+            return true;
+        }
+        // A child chain advanced; no parent block, so no pacing.
+        Ok(submission) if submission.disposition == "childOnly" => {
+            log("accepted child block(s) (childOnly)")
+        }
+        Ok(submission) => log(format!(
+            "the node refused work {work_id} nonce {nonce} ({})",
+            submission.disposition
+        )),
+        Err(e @ Error::Unauthorized(_)) => log(format!(
+            "the node refused the miner ({e}); check the token or cookie"
+        )),
+        Err(e) => log(format!(
+            "submitting work {work_id} nonce {nonce} failed ({e})"
+        )),
+    }
+    false
+}
+
 /// The workers a configuration names.
 fn workers(config: &MinerConfig) -> Vec<Arc<dyn StreamWorker>> {
     (0..config.workers())
@@ -171,13 +203,8 @@ pub async fn run(options: RunOptions, cancel: CancellationToken) -> Result<(), S
                 work_id,
                 nonce,
                 result,
-            } => match result {
-                Ok(Submission {
-                    accepted: true,
-                    tip_cid,
-                    ..
-                }) => {
-                    log(format!("accepted tip={}", tip_cid.unwrap_or_default()));
+            } => {
+                if log_submitted(&work_id, nonce, &result) {
                     let hold = config.pacing_hold(template_at.elapsed());
                     if !hold.is_zero() {
                         log(format!(
@@ -187,29 +214,24 @@ pub async fn run(options: RunOptions, cancel: CancellationToken) -> Result<(), S
                         session.pause(hold);
                     }
                 }
-                // A child chain advanced; no parent block, so no pacing.
-                Ok(submission) if submission.disposition == "childOnly" => {
-                    log("accepted child block(s) (childOnly)")
-                }
-                Ok(submission) => log(format!(
-                    "the node refused work {work_id} nonce {nonce} ({})",
-                    submission.disposition
-                )),
-                Err(e @ Error::Unauthorized(_)) => log(format!(
-                    "the node refused the miner ({e}); check the token or cookie"
-                )),
-                Err(e) => log(format!(
-                    "submitting work {work_id} nonce {nonce} failed ({e})"
-                )),
-            },
+            }
             Event::WorkerFailed { worker, error } => {
                 log(format!("worker {worker} failed ({error}); retrying"))
             }
         }
     }
-    // A found block is not dropped on shutdown: a submission in flight gets
-    // SUBMIT_GRACE to be answered.
-    session.finish(SUBMIT_GRACE).await;
+    // A found block is not dropped on shutdown: the workers stop, and every
+    // hit they found is submitted first.
+    for event in session.finish().await {
+        if let Event::Submitted {
+            work_id,
+            nonce,
+            result,
+        } = event
+        {
+            log_submitted(&work_id, nonce, &result);
+        }
+    }
     log("mining stopped");
     Ok(())
 }

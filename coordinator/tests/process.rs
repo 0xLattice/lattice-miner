@@ -165,7 +165,7 @@ async fn stream(code: &str, job: Job) -> (Vec<StreamHit>, Result<(), Error>) {
     let mut worker = ProcessWorker::new("p", "python3".into());
     worker.arguments = vec![path.to_string_lossy().into_owned()];
     let (jobs, receiver) = tokio::sync::mpsc::unbounded_channel();
-    let (sender, mut hits) = tokio::sync::mpsc::channel(8);
+    let (sender, mut hits) = tokio::sync::mpsc::unbounded_channel();
     let run = tokio::spawn(StreamWorker::stream(&worker, receiver, sender));
     jobs.send(job).unwrap();
     let mut seen = vec![];

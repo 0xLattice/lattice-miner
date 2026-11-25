@@ -61,8 +61,8 @@ Its settings are its own file, never the node's (default `miner.json`):
   miner neither searches for nor submits hashes below it; blocks still commit
   their scheduled target.
 - `minBlockIntervalSeconds`: a floor on the spacing of parent blocks, measured
-  from the latest template fetch: after a parent block the workers are given no
-  job until it has passed.
+  from the latest template fetch: after a parent block the workers idle (their
+  processes kept) until it has passed.
 - `templateTimeoutSeconds` (1 to 60, default 60): how long one request to the
   node may take, a template request including the node building it.
 - `roundDeadlineMultiplier` is accepted and unused: nothing is searched in
@@ -82,15 +82,17 @@ new template becomes their next job. Every hit is submitted, one at a time and
 in order, including hits on a template since replaced: a block solved on an old
 tip is still a valid block whose work counts. A hit that clears only some of
 the template's targets (a child chain's, `childOnly`) moves the same work on
-to the next harder target, keeping its place in the nonces; a hit found at a
-target the work has already passed is not submitted again; any other answer
-ends the search of that work until the next template. A dropped stream says
+to the next harder target, keeping its place in the nonces; an accepted block
+idles the workers until the next template; a `duplicate` changes nothing; any
+other refusal fetches a template at once. Hits are queued while one is being
+submitted, so a worker never waits to hand one over. A dropped stream says
 nothing about the chain: the search goes on, `GET /status` is polled every
 2 s meanwhile, and the stream is opened again after a wait doubling from
 250 ms to 5 s. A submission that fails in transit (no answer, HTTP 5xx) is
-retried up to 3 times. A failed template fetch, a refused submission or a
-failed worker is logged and retried after 5 s. SIGINT or SIGTERM stops the
-miner; a submission already in flight gets up to 10 s to be answered first. The recipients in effect are logged at
+retried up to 3 times. A failed template fetch or a failed worker is logged
+and retried after 5 s. SIGINT or SIGTERM stops the miner: the workers stop
+after the chunk they are on, and every hit they found is submitted first. The
+recipients in effect are logged at
 start and whenever they change, with a warning when none are named or a
 template mines a chain with none. `lattice-miner check --config miner.json`
 exits 0 if `run` would accept the file and 2 with the reason if not.

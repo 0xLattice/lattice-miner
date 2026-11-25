@@ -3,7 +3,9 @@
 //! template as a job, the Stratum way. A pushed template digest leads to one
 //! template fetch, at most one in flight, while the workers keep hashing the
 //! job they have; the new job replaces it when the fetch returns. Every hit
-//! is submitted, one at a time and in order, old work included. Nothing here
+//! is submitted, one at a time and in order, old work included; hits found
+//! meanwhile wait in the session, so a worker never waits to hand one over
+//! and always takes its next job. Nothing here
 //! expires on a clock: only transport (a failed fetch, a crashed worker)
 //! waits before trying again.
 use crate::*;
@@ -27,11 +29,11 @@ pub struct Job {
 /// A worker that runs for a whole session.
 pub trait StreamWorker: Send + Sync + 'static {
     /// Searches each job `jobs` brings, sending every hit to `hits`, until
-    /// `jobs` closes (`Ok`) or the worker fails.
+    /// `jobs` closes (`Ok`) or the worker fails. A zero target idles it.
     fn stream(
         &self,
         jobs: mpsc::UnboundedReceiver<Job>,
-        hits: mpsc::Sender<StreamHit>,
+        hits: mpsc::UnboundedSender<StreamHit>,
     ) -> BoxFuture<'static, Result<(), Error>>;
 }
 
@@ -76,8 +78,8 @@ pub enum Event {
     WorkerFailed { worker: usize, error: Error },
 }
 
-/// No hash is at or below it: the work has nothing more to give.
-const DONE: Target = [0; 32];
+/// No hash is at or below it: a worker given it idles where it is.
+const IDLE: Target = [0; 32];
 
 type Pending<T> = Option<BoxFuture<'static, T>>;
 
@@ -90,11 +92,10 @@ pub struct Session {
     running: BTreeMap<usize, (u64, mpsc::UnboundedSender<Job>)>,
     generation: u64,
     tasks: JoinSet<(usize, u64, Result<(), Error>)>,
-    hits: mpsc::Receiver<StreamHit>,
-    hit_sender: mpsc::Sender<StreamHit>,
-    /// The work searched: the target its hits are submitted at, and the
-    /// target the workers search it at.
-    current: Option<(Arc<Work>, Target, Target)>,
+    hits: mpsc::UnboundedReceiver<StreamHit>,
+    hit_sender: mpsc::UnboundedSender<StreamHit>,
+    /// The work searched, and the target the workers search it at.
+    current: Option<(Arc<Work>, Target)>,
     pushed: Option<String>,
     fetched: Option<String>,
     due: bool,
@@ -115,8 +116,7 @@ impl Session {
         digests: Option<watch::Receiver<Option<String>>>,
         options: SessionOptions,
     ) -> Self {
-        // Hits wait in the workers while one is submitted.
-        let (hit_sender, hits) = mpsc::channel(1);
+        let (hit_sender, hits) = mpsc::unbounded_channel();
         let mut session = Self {
             node,
             workers: vec![],
@@ -151,14 +151,13 @@ impl Session {
         }
     }
 
-    /// Withholds jobs for `hold`: the workers finish the chunk they are on
-    /// and fresh ones wait idle; then a template is fetched.
+    /// Withholds jobs for `hold`: the workers idle where they are (their
+    /// processes kept), then a template is fetched.
     pub fn pause(&mut self, hold: Duration) {
         self.paused_until = Some(Instant::now() + hold);
-        // Its hits still come in, and are all submitted.
-        self.current = None;
-        let workers = self.workers.clone();
-        self.replace(self.node.clone(), workers);
+        if let Some((work, _)) = self.current.clone() {
+            self.search(work, IDLE);
+        }
     }
 
     /// Mines through `node` with `workers` from now on. The workers replaced
@@ -179,19 +178,24 @@ impl Session {
         let generation = self.generation;
         self.tasks
             .spawn(async move { (worker, generation, search.await) });
-        if let Some((work, _, searched)) = self.current.clone() {
-            let _ = jobs.send(job(work, searched, worker, self.workers.len()));
+        if let Some((work, target)) = self.current.clone() {
+            let _ = jobs.send(job(work, target, worker, self.workers.len()));
         }
         self.running.insert(worker, (generation, jobs));
     }
 
-    /// Every running worker searches `work` at `searched`; its hits are
-    /// submitted at `open` or below.
-    fn search(&mut self, work: Arc<Work>, open: Target, searched: Target) {
-        self.current = Some((work.clone(), open, searched));
+    /// Every running worker searches `work` at `target`; while paused, it
+    /// idles.
+    fn search(&mut self, work: Arc<Work>, target: Target) {
+        let target = if self.paused_until.is_some() {
+            IDLE
+        } else {
+            target
+        };
+        self.current = Some((work.clone(), target));
         let count = self.workers.len();
         for (worker, (_, jobs)) in &self.running {
-            let _ = jobs.send(job(work.clone(), searched, *worker, count));
+            let _ = jobs.send(job(work.clone(), target, *worker, count));
         }
     }
 
@@ -242,9 +246,11 @@ impl Session {
                             self.fetched = Some(work.stale_token.clone());
                             // Fetched again only if the node pushed another since.
                             self.due = self.pushed.as_ref().is_some_and(|p| *p != work.stale_token);
-                            let same = self.current.as_ref().is_some_and(|(w, _, _)| w.work_id == work.work_id);
-                            if !same && self.paused_until.is_none() {
-                                self.search(work.clone(), work.target, work.target);
+                            // The same work goes on where it is, unless it
+                            // was idled: then it is searched again.
+                            let going = self.current.as_ref().is_some_and(|(w, t)| w.work_id == work.work_id && *t != IDLE);
+                            if !going && self.paused_until.is_none() {
+                                self.search(work.clone(), work.target);
                             }
                         }
                         _ => self.retry_fetch_at = Some(Instant::now() + self.options.retry_wait),
@@ -277,14 +283,6 @@ impl Session {
                     }
                 }
                 Some(hit) = self.hits.recv(), if !submitting => {
-                    if let Some((work, open, _)) = &self.current
-                        && work.work_id == hit.work_id
-                        && lattice_pow::hash(&work.prefix, hit.nonce) > *open
-                    {
-                        // Found under a target this work has since passed:
-                        // what it would add is already submitted.
-                        continue;
-                    }
                     let (node, options) = (self.node.clone(), self.options.clone());
                     self.submitting = Some(async move {
                         let result = submit(&*node, &hit, &options).await;
@@ -300,46 +298,63 @@ impl Session {
     }
 
     /// A child-only hit on the work searched moves its search on to the next
-    /// harder target; any other answer ends the search of the work, though
-    /// hits already found at its open target are still submitted.
+    /// harder target; an accepted block idles it until the next template;
+    /// another refusal fetches one at once; a duplicate changes nothing.
     fn submitted(&mut self, hit: &StreamHit, result: &Result<Submission, Error>) {
         let Ok(submission) = result else { return };
+        let current = self
+            .current
+            .clone()
+            .filter(|(work, _)| work.work_id == hit.work_id);
         if submission.accepted {
             // The tip moved.
             self.due = true;
+            if let Some((work, _)) = current {
+                self.search(work, IDLE);
+            }
+            return;
         }
-        let Some((work, open, searched)) = self.current.clone() else {
+        let Some((work, target)) = current else {
             return;
         };
-        if work.work_id != hit.work_id {
-            return;
-        }
-        let hash = lattice_pow::hash(&work.prefix, hit.nonce);
-        let harder = work.targets.iter().copied().find(|t| *t < hash);
-        let (open, next) = match harder {
-            Some(target) if !submission.accepted && submission.disposition == "childOnly" => {
-                (open.min(target), searched.min(target))
-            }
-            _ => {
-                if !submission.accepted && submission.disposition != "childOnly" {
-                    // Refused: a fresh template, after the retry wait.
-                    self.retry_fetch_at
-                        .get_or_insert(Instant::now() + self.options.retry_wait);
+        match submission.disposition.as_str() {
+            "duplicate" => {}
+            "childOnly" => {
+                let hash = lattice_pow::hash(&work.prefix, hit.nonce);
+                let harder = work.targets.iter().copied().find(|t| *t < hash);
+                let next = harder.unwrap_or(IDLE).min(target);
+                if next < target {
+                    self.search(work, next);
                 }
-                (open, DONE)
             }
-        };
-        if next < searched {
-            self.search(work, open, next);
+            // The node will not take this work's hits: a template now.
+            _ => self.due = true,
         }
     }
 
-    /// Waits up to `grace` for a submission in flight to be answered; the
-    /// workers stop as the session is dropped.
-    pub async fn finish(mut self, grace: Duration) {
+    /// Stops the workers and submits every hit they have found, those still
+    /// to come as they stop included. Returns what each submission answered.
+    pub async fn finish(mut self) -> Vec<Event> {
+        // Their jobs closed, the workers stop after the chunk they are on.
+        self.running.clear();
+        while self.tasks.join_next().await.is_some() {}
+        let mut answered = vec![];
         if let Some(submitting) = self.submitting.take() {
-            let _ = tokio::time::timeout(grace, submitting).await;
+            let (hit, result) = submitting.await;
+            answered.push((hit, result));
         }
+        while let Ok(hit) = self.hits.try_recv() {
+            let result = submit(&*self.node, &hit, &self.options).await;
+            answered.push((hit, result));
+        }
+        answered
+            .into_iter()
+            .map(|(hit, result)| Event::Submitted {
+                work_id: hit.work_id,
+                nonce: hit.nonce,
+                result,
+            })
+            .collect()
     }
 }
 

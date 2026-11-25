@@ -57,7 +57,7 @@ async fn actual_external_worker_streams_every_hit() {
         stale_token: "fixed".into(),
     });
     let (jobs, receiver) = tokio::sync::mpsc::unbounded_channel();
-    let (sender, mut hits) = tokio::sync::mpsc::channel(8);
+    let (sender, mut hits) = tokio::sync::mpsc::unbounded_channel();
     let run = tokio::spawn(StreamWorker::stream(&worker, receiver, sender));
     jobs.send(Job {
         work: work.clone(),

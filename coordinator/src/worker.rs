@@ -260,7 +260,7 @@ impl StreamWorker for CpuWorker {
     fn stream(
         &self,
         mut jobs: tokio::sync::mpsc::UnboundedReceiver<Job>,
-        hits: tokio::sync::mpsc::Sender<StreamHit>,
+        hits: tokio::sync::mpsc::UnboundedSender<StreamHit>,
     ) -> BoxFuture<'static, Result<(), Error>> {
         async move {
             tokio::task::spawn_blocking(move || {
@@ -269,8 +269,10 @@ impl StreamWorker for CpuWorker {
                 let mut current: Option<(Job, Sha256, u64)> = None;
                 loop {
                     loop {
-                        let next = match current {
+                        let next = match &current {
+                            // Nothing to search, or a zero target: wait.
                             None => jobs.blocking_recv(),
+                            Some((job, _, _)) if job.target == [0; 32] => jobs.blocking_recv(),
                             Some(_) => match jobs.try_recv() {
                                 Ok(job) => Some(job),
                                 Err(TryRecvError::Empty) => break,
@@ -305,7 +307,7 @@ impl StreamWorker for CpuWorker {
                                 nonce: found,
                                 hash: hex::encode(hash),
                             };
-                            if hits.blocking_send(hit).is_err() {
+                            if hits.send(hit).is_err() {
                                 return;
                             }
                             break;
@@ -326,7 +328,7 @@ impl StreamWorker for ProcessWorker {
     fn stream(
         &self,
         mut jobs: tokio::sync::mpsc::UnboundedReceiver<Job>,
-        hits: tokio::sync::mpsc::Sender<StreamHit>,
+        hits: tokio::sync::mpsc::UnboundedSender<StreamHit>,
     ) -> BoxFuture<'static, Result<(), Error>> {
         let this = self.clone();
         async move {
@@ -379,7 +381,9 @@ impl StreamWorker for ProcessWorker {
                             let hit: StreamHit = serde_json::from_str(&line).map_err(|_| {
                                 Error::Worker(format!("invalid worker line: {line}"))
                             })?;
-                            if hits.send(hit).await.is_err() {
+                            // Never waits: the session keeps what it has not
+                            // submitted yet, so the next job is never held up.
+                            if hits.send(hit).is_err() {
                                 return Ok(());
                             }
                         }

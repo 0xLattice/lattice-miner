@@ -55,6 +55,8 @@ struct Node {
     submits: Mutex<Vec<(String, u64)>>,
     in_flight: AtomicUsize,
     most_in_flight: AtomicUsize,
+    /// Submissions wait while this is set.
+    hold_submits: std::sync::atomic::AtomicBool,
 }
 
 impl Node {
@@ -67,6 +69,7 @@ impl Node {
             submits: Mutex::new(vec![]),
             in_flight: AtomicUsize::new(0),
             most_in_flight: AtomicUsize::new(0),
+            hold_submits: Default::default(),
         })
     }
     fn submits(&self) -> Vec<(String, u64)> {
@@ -92,6 +95,9 @@ impl NodeClient for Node {
             self.most_in_flight.fetch_max(now, Ordering::SeqCst);
             self.submits.lock().unwrap().push((id, nonce));
             tokio::time::sleep(Duration::from_millis(10)).await;
+            while self.hold_submits.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
             let answer = self
                 .answers
@@ -116,7 +122,7 @@ struct Workers {
     started: AtomicUsize,
     /// (start, work, target, start nonce), in arrival order.
     jobs: Mutex<Vec<(usize, String, Target, u64)>>,
-    hits: Mutex<Vec<mpsc::Sender<StreamHit>>>,
+    hits: Mutex<Vec<mpsc::UnboundedSender<StreamHit>>>,
     closed: Mutex<Vec<usize>>,
     /// Starts that fail after their first job.
     failing: Mutex<Vec<usize>>,
@@ -128,7 +134,7 @@ impl StreamWorker for Fake {
     fn stream(
         &self,
         mut jobs: mpsc::UnboundedReceiver<Job>,
-        hits: mpsc::Sender<StreamHit>,
+        hits: mpsc::UnboundedSender<StreamHit>,
     ) -> BoxFuture<'static, Result<(), Error>> {
         let state = self.0.clone();
         let start = state.started.fetch_add(1, Ordering::SeqCst);
@@ -229,11 +235,9 @@ fn hits(workers: &Workers, start: usize, found: &[(&str, u64)]) {
             hash: String::new(),
         })
         .collect();
-    tokio::spawn(async move {
-        for hit in found {
-            sender.send(hit).await.unwrap();
-        }
-    });
+    for hit in found {
+        sender.send(hit).unwrap();
+    }
 }
 
 #[tokio::test]
@@ -330,8 +334,14 @@ async fn child_only_searches_the_same_work_harder_and_a_parent_block_ends_it() {
         submitted(next(&mut session).await),
         ("w1".into(), child, "childOnly".into())
     );
-    // Found at the easier target the work has passed: not submitted again.
+    // Found at the easier target the work has since passed: a solution,
+    // so submitted all the same.
+    node.answers.lock().unwrap().push_front("childOnly");
     hits(&workers, 0, &[("w1", passed), ("w1", parent)]);
+    assert_eq!(
+        submitted(next(&mut session).await),
+        ("w1".into(), passed, "childOnly".into())
+    );
     assert_eq!(
         submitted(next(&mut session).await),
         ("w1".into(), parent, "accepted".into())
@@ -346,6 +356,7 @@ async fn child_only_searches_the_same_work_harder_and_a_parent_block_ends_it() {
         node.submits(),
         vec![
             ("w1".into(), child),
+            ("w1".into(), passed),
             ("w1".into(), parent),
             ("w1".into(), sibling)
         ]
@@ -397,14 +408,191 @@ async fn a_pause_withholds_jobs_until_it_ends() {
     pushes.send_replace(Some("d2".into()));
     quiet(&mut session).await;
     assert_eq!(node.fetches.load(Ordering::SeqCst), 1);
-    // The worker searching was stopped; a fresh one waits with no job.
-    assert_eq!(*workers.closed.lock().unwrap(), vec![0]);
-    assert_eq!(workers.started.load(Ordering::SeqCst), 2);
-    assert_eq!(jobs(&workers).await, vec![(0, "w1".into(), EASY, 0)]);
+    // The same worker process idles on a zero target: nothing restarts.
+    assert!(workers.closed.lock().unwrap().is_empty());
+    assert_eq!(workers.started.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        jobs(&workers).await,
+        vec![(0, "w1".into(), EASY, 0), (0, "w1".into(), [0; 32], 0)]
+    );
     assert!(matches!(next(&mut session).await, Event::FetchDue));
     assert_eq!(fetched(next(&mut session).await), "w2");
     assert_eq!(
         jobs(&workers).await,
-        vec![(0, "w1".into(), EASY, 0), (1, "w2".into(), EASY, 0)]
+        vec![
+            (0, "w1".into(), EASY, 0),
+            (0, "w1".into(), [0; 32], 0),
+            (0, "w2".into(), EASY, 0)
+        ]
     );
+    assert_eq!(workers.started.load(Ordering::SeqCst), 1);
+}
+
+/// A worker process with hits waiting while a submission is in flight still
+/// gets the next job.
+#[cfg(unix)]
+#[tokio::test]
+async fn hits_waiting_to_be_submitted_do_not_hold_up_the_next_job() {
+    let node = Node::new(vec![work("w1", "d1"), work("w2", "d2")]);
+    node.hold_submits.store(true, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let (script, seen) = (dir.path().join("worker.py"), dir.path().join("jobs"));
+    // Every job it gets is written down; the first is answered with three hits.
+    std::fs::write(
+        &script,
+        r#"import sys, json
+log = open(sys.argv[1], 'a')
+hits = [int(n) for n in sys.argv[2].split(',')]
+for line in sys.stdin:
+    job = json.loads(line)
+    log.write(job['workId'] + '\n'); log.flush()
+    for n in hits:
+        print(json.dumps({'workId': job['workId'], 'nonce': n, 'hash': ''}), flush=True)
+    hits = []
+"#,
+    )
+    .unwrap();
+    let found: Vec<String> = (0..3)
+        .map(|i| nonce("w1", HARD, EASY, i).to_string())
+        .collect();
+    let mut worker = ProcessWorker::new("p", "python3".into());
+    worker.arguments = vec![
+        script.to_string_lossy().into_owned(),
+        seen.to_string_lossy().into_owned(),
+        found.join(","),
+    ];
+    let (pushes, digests) = watch::channel(Some("d0".to_string()));
+    let mut session = Session::new(
+        node.clone(),
+        vec![Arc::new(worker) as Arc<dyn StreamWorker>],
+        Some(digests),
+        SessionOptions::default(),
+    );
+    node.gate.add_permits(2);
+    next(&mut session).await;
+    assert_eq!(fetched(next(&mut session).await), "w1");
+    // The first hit is being submitted, the others wait.
+    let _ = tokio::time::timeout(Duration::from_millis(500), session.next()).await;
+    assert_eq!(node.submits().len(), 1);
+    pushes.send_replace(Some("d2".into()));
+    assert!(matches!(next(&mut session).await, Event::FetchDue));
+    assert_eq!(fetched(next(&mut session).await), "w2");
+    // The first hit's submission is still waiting; w2 reaches the worker.
+    let reached = tokio::time::timeout(Duration::from_secs(5), async {
+        while !std::fs::read_to_string(&seen)
+            .unwrap_or_default()
+            .contains("w2")
+        {
+            tokio::select! {
+                _ = session.next() => {}
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        }
+    })
+    .await;
+    assert!(reached.is_ok(), "the new job never reached the worker");
+    assert_eq!(node.submits().len(), 1);
+}
+
+#[tokio::test]
+async fn a_duplicate_changes_nothing_and_a_refusal_fetches_at_once() {
+    let node = Node::new(vec![work("w1", "d1"), work("w1", "d1")]);
+    let workers = Arc::new(Workers::default());
+    let (mut session, _pushes) = session(&node, &workers, 1);
+    node.gate.add_permits(2);
+    next(&mut session).await;
+    assert_eq!(fetched(next(&mut session).await), "w1");
+    node.answers
+        .lock()
+        .unwrap()
+        .extend(["duplicate", "invalid"]);
+    let (a, b) = (nonce("w1", HARD, EASY, 0), nonce("w1", HARD, EASY, 1));
+    hits(&workers, 0, &[("w1", a)]);
+    assert_eq!(submitted(next(&mut session).await).2, "duplicate");
+    quiet(&mut session).await;
+    hits(&workers, 0, &[("w1", b)]);
+    assert_eq!(submitted(next(&mut session).await).2, "invalid");
+    // Not a transport failure: a template at once, and the search goes on.
+    let event = tokio::time::timeout(Duration::from_millis(20), session.next())
+        .await
+        .expect("a fetch due at once");
+    assert!(matches!(event, Event::FetchDue));
+    assert_eq!(jobs(&workers).await, vec![(0, "w1".into(), EASY, 0)]);
+}
+
+#[tokio::test]
+async fn the_same_work_fetched_again_after_it_ended_is_searched_again() {
+    let node = Node::new(vec![work("w1", "d1"), work("w1", "d1")]);
+    let workers = Arc::new(Workers::default());
+    let (mut session, _pushes) = session(&node, &workers, 1);
+    node.gate.add_permits(2);
+    next(&mut session).await;
+    assert_eq!(fetched(next(&mut session).await), "w1");
+    node.answers.lock().unwrap().push_back("accepted");
+    hits(&workers, 0, &[("w1", nonce("w1", [0; 32], HARD, 0))]);
+    assert_eq!(submitted(next(&mut session).await).2, "accepted");
+    assert!(matches!(next(&mut session).await, Event::FetchDue));
+    assert_eq!(fetched(next(&mut session).await), "w1");
+    assert_eq!(
+        jobs(&workers).await,
+        vec![
+            (0, "w1".into(), EASY, 0),
+            (0, "w1".into(), [0; 32], 0),
+            (0, "w1".into(), EASY, 0)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn finishing_submits_every_hit_already_found() {
+    let node = Node::new(vec![work("w1", "d1")]);
+    let workers = Arc::new(Workers::default());
+    let (mut session, _pushes) = session(&node, &workers, 1);
+    node.gate.add_permits(1);
+    next(&mut session).await;
+    assert_eq!(fetched(next(&mut session).await), "w1");
+    node.hold_submits.store(true, Ordering::SeqCst);
+    let found: Vec<u64> = (0..3).map(|i| nonce("w1", HARD, EASY, i)).collect();
+    hits(
+        &workers,
+        0,
+        &[("w1", found[0]), ("w1", found[1]), ("w1", found[2])],
+    );
+    let _ = tokio::time::timeout(Duration::from_millis(200), session.next()).await;
+    assert_eq!(node.submits().len(), 1);
+    node.hold_submits.store(false, Ordering::SeqCst);
+    let events = tokio::time::timeout(Duration::from_secs(5), session.finish())
+        .await
+        .expect("finished");
+    assert_eq!(events.len(), 3);
+    assert_eq!(
+        node.submits(),
+        found
+            .iter()
+            .map(|n| ("w1".to_string(), *n))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The in-process worker idles on a zero target and goes on from where it
+/// was.
+#[tokio::test]
+async fn the_cpu_worker_idles_on_a_zero_target() {
+    let (jobs, receiver) = mpsc::unbounded_channel();
+    let (sender, mut hits) = mpsc::unbounded_channel();
+    let stream = CpuWorker::new("cpu").stream(receiver, sender);
+    let task = tokio::spawn(stream);
+    let w1 = Arc::new(work("w1", "d1"));
+    let job = |target| Job {
+        work: w1.clone(),
+        target,
+        start_nonce: 0,
+    };
+    jobs.send(job([0; 32])).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    jobs.send(job(EASY)).unwrap();
+    let first = hits.recv().await.unwrap();
+    assert_eq!(first.nonce, nonce("w1", [0; 32], EASY, 0));
+    drop(jobs);
+    task.await.unwrap().unwrap();
 }
