@@ -3,13 +3,14 @@
 //! template as a job, the Stratum way. A pushed template digest leads to one
 //! template fetch, at most one in flight, while the workers keep hashing the
 //! job they have; the new job replaces it when the fetch returns. Every hit
-//! is submitted, one at a time and in order, old work included; hits found
-//! meanwhile wait in the session, so a worker never waits to hand one over
-//! and always takes its next job. Nothing here
-//! expires on a clock: only transport (a failed fetch, a crashed worker)
-//! waits before trying again.
+//! is submitted as soon as it arrives, old work included, as a Stratum pool
+//! takes shares: submissions run side by side and each answer is acted on as
+//! it comes, so hits on an old template never hold up the current one's, and
+//! a worker never waits to hand one over. Nothing here expires on a clock:
+//! only transport (a failed fetch, a crashed worker) waits before trying
+//! again.
 use crate::*;
-use futures_util::{FutureExt, future::BoxFuture};
+use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::{
     sync::{mpsc, watch},
@@ -107,7 +108,11 @@ pub struct Session {
     fetched: Option<String>,
     due: bool,
     fetching: Pending<Result<Option<Work>, Error>>,
-    submitting: Pending<(StreamHit, Result<Submission, Error>)>,
+    /// Every submission not yet answered.
+    submitting: FuturesUnordered<BoxFuture<'static, (StreamHit, Result<Submission, Error>)>>,
+    /// Per worker, the nonce after its last hit on the current work: where a
+    /// worker started again resumes.
+    resume: BTreeMap<usize, u64>,
     probing: Pending<Option<String>>,
     next_probe: Instant,
     retry_fetch_at: Option<Instant>,
@@ -139,7 +144,8 @@ impl Session {
             fetched: None,
             due: true,
             fetching: None,
-            submitting: None,
+            submitting: FuturesUnordered::new(),
+            resume: BTreeMap::new(),
             probing: None,
             next_probe: Instant::now(),
             retry_fetch_at: None,
@@ -159,12 +165,21 @@ impl Session {
     }
 
     /// Withholds jobs for `hold`: the workers idle where they are (their
-    /// processes kept), then a template is fetched.
+    /// processes kept), then a template is fetched. A hold already running
+    /// is not extended.
     pub fn pause(&mut self, hold: Duration) {
+        if self.paused_until.is_some() {
+            return;
+        }
         self.paused_until = Some(Instant::now() + hold);
         if let Some((work, _)) = self.current.clone() {
             self.search(work, IDLE);
         }
+    }
+
+    /// Whether a [`Session::pause`] is holding the workers.
+    pub fn paused(&self) -> bool {
+        self.paused_until.is_some()
     }
 
     /// Mines through `node` with `workers` from now on. The workers replaced
@@ -172,6 +187,10 @@ impl Session {
     pub fn replace(&mut self, node: Arc<dyn NodeClient>, workers: Vec<Arc<dyn StreamWorker>>) {
         self.node = node;
         self.running.clear();
+        if workers.len() != self.workers.len() {
+            // The nonce space is shared out differently.
+            self.resume.clear();
+        }
         self.workers = workers;
         for worker in 0..self.workers.len() {
             self.start(worker);
@@ -186,7 +205,10 @@ impl Session {
         self.tasks
             .spawn(async move { (worker, generation, search.await) });
         if let Some((work, target)) = self.current.clone() {
-            let _ = jobs.send(job(work, target, worker, self.workers.len()));
+            // Started again on the same work: on from its last hit.
+            let mut job = self.job(work, target, worker);
+            job.start_nonce = self.resume.get(&worker).copied().unwrap_or(job.start_nonce);
+            let _ = jobs.send(job);
         }
         self.running.insert(worker, (generation, jobs));
     }
@@ -199,11 +221,50 @@ impl Session {
         } else {
             target
         };
-        self.current = Some((work.clone(), target));
-        let count = self.workers.len();
-        for (worker, (_, jobs)) in &self.running {
-            let _ = jobs.send(job(work.clone(), target, *worker, count));
+        if self
+            .current
+            .as_ref()
+            .is_none_or(|(w, _)| w.work_id != work.work_id)
+        {
+            self.resume.clear();
         }
+        self.current = Some((work.clone(), target));
+        for (worker, (_, jobs)) in &self.running {
+            let _ = jobs.send(self.job(work.clone(), target, *worker));
+        }
+    }
+
+    /// Worker `worker` searches a new work from its own share of the nonce
+    /// space.
+    fn job(&self, work: Arc<Work>, target: Target, worker: usize) -> Job {
+        let start_nonce = allocate_ranges(u64::MAX, self.workers.len(), 0)[worker].start_nonce;
+        Job {
+            work,
+            target,
+            start_nonce,
+        }
+    }
+
+    /// Submits `hit`, noting where its worker has searched to.
+    fn found(&mut self, hit: StreamHit) {
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|(work, _)| work.work_id == hit.work_id)
+            && let Some(worker) = allocate_ranges(u64::MAX, self.workers.len(), 0)
+                .iter()
+                .position(|range| range.contains(hit.nonce))
+        {
+            self.resume.insert(worker, hit.nonce.wrapping_add(1));
+        }
+        let (node, options) = (self.node.clone(), self.options.clone());
+        self.submitting.push(
+            async move {
+                let result = submit(&*node, &hit, &options).await;
+                (hit, result)
+            }
+            .boxed(),
+        );
     }
 
     fn pushed(&mut self, digest: String) {
@@ -226,7 +287,7 @@ impl Session {
                 return Event::FetchDue;
             }
             let polling = !self.connected() && self.probing.is_none();
-            let submitting = self.submitting.is_some();
+            let submitting = !self.submitting.is_empty();
             tokio::select! {
                 changed = changed(&mut self.digests) => {
                     match changed {
@@ -289,14 +350,8 @@ impl Session {
                         return Event::WorkerFailed { worker, error };
                     }
                 }
-                Some(hit) = self.hits.recv(), if !submitting => {
-                    let (node, options) = (self.node.clone(), self.options.clone());
-                    self.submitting = Some(async move {
-                        let result = submit(&*node, &hit, &options).await;
-                        (hit, result)
-                    }.boxed());
-                }
-                (hit, result) = poll(&mut self.submitting) => {
+                Some(hit) = self.hits.recv() => self.found(hit),
+                Some((hit, result)) = self.submitting.next(), if submitting => {
                     self.submitted(&hit, &result);
                     return Event::Submitted { work_id: hit.work_id, nonce: hit.nonce, result };
                 }
@@ -341,18 +396,25 @@ impl Session {
 
     /// Stops the workers and submits every hit they have found, those still
     /// to come as they stop included. Returns what each submission answered.
+    /// Dropping it stops at once: the workers are killed, and submissions not
+    /// yet answered are abandoned.
     pub async fn finish(mut self) -> Vec<Event> {
         // Their jobs closed, the workers stop after the chunk they are on.
         self.running.clear();
-        while self.tasks.join_next().await.is_some() {}
         let mut answered = vec![];
-        if let Some(submitting) = self.submitting.take() {
-            let (hit, result) = submitting.await;
-            answered.push((hit, result));
+        loop {
+            let submitting = !self.submitting.is_empty();
+            tokio::select! {
+                joined = self.tasks.join_next() => if joined.is_none() { break },
+                Some(hit) = self.hits.recv() => self.found(hit),
+                Some(answer) = self.submitting.next(), if submitting => answered.push(answer),
+            }
         }
         while let Ok(hit) = self.hits.try_recv() {
-            let result = submit(&*self.node, &hit, &self.options).await;
-            answered.push((hit, result));
+            self.found(hit);
+        }
+        while let Some(answer) = self.submitting.next().await {
+            answered.push(answer);
         }
         answered
             .into_iter()
@@ -362,17 +424,6 @@ impl Session {
                 result,
             })
             .collect()
-    }
-}
-
-/// Worker `worker` of `count` starts its search of a new work at its own
-/// share of the nonce space.
-fn job(work: Arc<Work>, target: Target, worker: usize, count: usize) -> Job {
-    let start_nonce = allocate_ranges(u64::MAX, count, 0)[worker].start_nonce;
-    Job {
-        work,
-        target,
-        start_nonce,
     }
 }
 

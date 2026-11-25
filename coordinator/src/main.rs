@@ -61,21 +61,26 @@ async fn main() {
             }
         },
     };
-    let cancel = CancellationToken::new();
-    let stop = cancel.clone();
+    // The first SIGINT or SIGTERM stops mining once every hit found is
+    // submitted; a second stops it at once.
+    let (cancel, force) = (CancellationToken::new(), CancellationToken::new());
+    let (stop, now) = (cancel.clone(), force.clone());
     tokio::spawn(async move {
         #[cfg(unix)]
-        {
+        let mut term = {
             use tokio::signal::unix::{SignalKind, signal};
-            let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+            signal(SignalKind::terminate()).expect("SIGTERM handler")
+        };
+        for token in [stop, now] {
+            #[cfg(unix)]
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {}
                 _ = term.recv() => {}
             }
+            #[cfg(not(unix))]
+            let _ = tokio::signal::ctrl_c().await;
+            token.cancel();
         }
-        #[cfg(not(unix))]
-        let _ = tokio::signal::ctrl_c().await;
-        stop.cancel();
     });
     let auth = match (args.token_file, args.cookie_file) {
         (Some(token), _) => Auth::Bearer(token),
@@ -87,7 +92,7 @@ async fn main() {
         auth,
         config: args.config,
     };
-    if let Err(e) = run(options, cancel).await {
+    if let Err(e) = run(options, cancel, force).await {
         eprintln!("error: {e}");
         std::process::exit(2);
     }

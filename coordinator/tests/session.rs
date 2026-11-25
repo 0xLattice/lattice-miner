@@ -94,17 +94,18 @@ impl NodeClient for Node {
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.most_in_flight.fetch_max(now, Ordering::SeqCst);
             self.submits.lock().unwrap().push((id, nonce));
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            while self.hold_submits.load(Ordering::SeqCst) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            // Answers go to submissions in the order they are made.
             let answer = self
                 .answers
                 .lock()
                 .unwrap()
                 .pop_front()
                 .unwrap_or("childOnly");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            while self.hold_submits.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
             Ok(Submission {
                 accepted: answer == "accepted",
                 disposition: answer.into(),
@@ -126,6 +127,8 @@ struct Workers {
     closed: Mutex<Vec<usize>>,
     /// Starts that fail after their first job.
     failing: Mutex<Vec<usize>>,
+    /// Hits a worker sends as it stops, a moment after its jobs close.
+    parting: Mutex<Vec<StreamHit>>,
 }
 
 struct Fake(Arc<Workers>);
@@ -138,7 +141,7 @@ impl StreamWorker for Fake {
     ) -> BoxFuture<'static, Result<(), Error>> {
         let state = self.0.clone();
         let start = state.started.fetch_add(1, Ordering::SeqCst);
-        state.hits.lock().unwrap().push(hits);
+        state.hits.lock().unwrap().push(hits.clone());
         async move {
             while let Some(job) = jobs.recv().await {
                 state.jobs.lock().unwrap().push((
@@ -150,6 +153,10 @@ impl StreamWorker for Fake {
                 if state.failing.lock().unwrap().contains(&start) {
                     return Err(Error::Worker("fixture failure".into()));
                 }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            for hit in state.parting.lock().unwrap().drain(..) {
+                let _ = hits.send(hit);
             }
             state.closed.lock().unwrap().push(start);
             Ok(())
@@ -285,7 +292,7 @@ async fn pushed_digests_lead_to_one_fetch_at_a_time_and_jobs_to_the_same_workers
 }
 
 #[tokio::test]
-async fn every_hit_is_submitted_in_order_one_at_a_time_old_work_included() {
+async fn every_hit_is_submitted_at_once_old_work_included() {
     let node = Node::new(vec![work("w1", "d1"), work("w2", "d2")]);
     let workers = Arc::new(Workers::default());
     let (mut session, pushes) = session(&node, &workers, 1);
@@ -309,9 +316,13 @@ async fn every_hit_is_submitted_in_order_one_at_a_time_old_work_included() {
         ("w1".to_string(), b),
         ("w2".to_string(), c),
     ];
+    answered.sort();
+    let mut submits = node.submits();
+    submits.sort();
     assert_eq!(answered, expected);
-    assert_eq!(node.submits(), expected);
-    assert_eq!(node.most_in_flight.load(Ordering::SeqCst), 1);
+    assert_eq!(submits, expected);
+    // Side by side, none waiting for another's answer.
+    assert_eq!(node.most_in_flight.load(Ordering::SeqCst), 3);
 }
 
 #[tokio::test]
@@ -380,18 +391,28 @@ async fn a_failed_worker_is_started_again_with_the_current_job() {
     node.gate.add_permits(1);
     next(&mut session).await;
     assert_eq!(fetched(next(&mut session).await), "w1");
-    match next(&mut session).await {
-        Event::WorkerFailed { worker: 0, error } => {
-            assert!(error.to_string().contains("fixture failure"))
+    // What it found before it failed.
+    let found = nonce("w1", HARD, EASY, 2);
+    node.answers.lock().unwrap().push_back("duplicate");
+    hits(&workers, 0, &[("w1", found)]);
+    let mut failed = None;
+    let _ = tokio::time::timeout(Duration::from_millis(300), async {
+        loop {
+            if let Event::WorkerFailed { worker, error } = session.next().await {
+                failed = Some((worker, error.to_string()));
+            }
         }
-        other => panic!("expected a failed worker, got {other:?}"),
-    }
-    // After the retry wait, a new worker takes the work searched.
-    quiet(&mut session).await;
+    })
+    .await;
+    let (worker, error) = failed.expect("a failed worker");
+    assert_eq!(worker, 0);
+    assert!(error.contains("fixture failure"));
+    // After the retry wait, a new worker takes the work searched, on from
+    // the last hit rather than over nonces already covered.
     assert_eq!(workers.started.load(Ordering::SeqCst), 2);
     assert_eq!(
         jobs(&workers).await,
-        vec![(0, "w1".into(), EASY, 0), (1, "w1".into(), EASY, 0)]
+        vec![(0, "w1".into(), EASY, 0), (1, "w1".into(), EASY, found + 1)]
     );
 }
 
@@ -471,13 +492,13 @@ for line in sys.stdin:
     node.gate.add_permits(2);
     next(&mut session).await;
     assert_eq!(fetched(next(&mut session).await), "w1");
-    // The first hit is being submitted, the others wait.
+    // Every hit is being submitted, none answered yet.
     let _ = tokio::time::timeout(Duration::from_millis(500), session.next()).await;
-    assert_eq!(node.submits().len(), 1);
+    assert_eq!(node.submits().len(), 3);
     pushes.send_replace(Some("d2".into()));
     assert!(matches!(next(&mut session).await, Event::FetchDue));
     assert_eq!(fetched(next(&mut session).await), "w2");
-    // The first hit's submission is still waiting; w2 reaches the worker.
+    // The submissions are still waiting; w2 reaches the worker.
     let reached = tokio::time::timeout(Duration::from_secs(5), async {
         while !std::fs::read_to_string(&seen)
             .unwrap_or_default()
@@ -491,7 +512,7 @@ for line in sys.stdin:
     })
     .await;
     assert!(reached.is_ok(), "the new job never reached the worker");
-    assert_eq!(node.submits().len(), 1);
+    assert_eq!(node.submits().len(), 3);
 }
 
 #[tokio::test]
@@ -559,19 +580,28 @@ async fn finishing_submits_every_hit_already_found() {
         &[("w1", found[0]), ("w1", found[1]), ("w1", found[2])],
     );
     let _ = tokio::time::timeout(Duration::from_millis(200), session.next()).await;
-    assert_eq!(node.submits().len(), 1);
+    assert_eq!(node.submits().len(), 3);
+    // One more, found as the worker stops.
+    let last = nonce("w1", HARD, EASY, 3);
+    workers.parting.lock().unwrap().push(StreamHit {
+        work_id: "w1".into(),
+        nonce: last,
+        hash: String::new(),
+    });
     node.hold_submits.store(false, Ordering::SeqCst);
     let events = tokio::time::timeout(Duration::from_secs(5), session.finish())
         .await
         .expect("finished");
-    assert_eq!(events.len(), 3);
-    assert_eq!(
-        node.submits(),
-        found
-            .iter()
-            .map(|n| ("w1".to_string(), *n))
-            .collect::<Vec<_>>()
-    );
+    assert_eq!(events.len(), 4);
+    let mut submits = node.submits();
+    submits.sort();
+    let mut expected: Vec<_> = found
+        .iter()
+        .chain([&last])
+        .map(|n| ("w1".to_string(), *n))
+        .collect();
+    expected.sort();
+    assert_eq!(submits, expected);
 }
 
 /// The in-process worker idles on a zero target and goes on from where it
@@ -595,4 +625,113 @@ async fn the_cpu_worker_idles_on_a_zero_target() {
     assert_eq!(first.nonce, nonce("w1", [0; 32], EASY, 0));
     drop(jobs);
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_pause_is_not_extended_by_another() {
+    let node = Node::new(vec![work("w1", "d1"), work("w2", "d2")]);
+    let workers = Arc::new(Workers::default());
+    let (mut session, _pushes) = session(&node, &workers, 1);
+    node.gate.add_permits(2);
+    next(&mut session).await;
+    assert_eq!(fetched(next(&mut session).await), "w1");
+    let paused = tokio::time::Instant::now();
+    session.pause(Duration::from_millis(300));
+    let _ = tokio::time::timeout(Duration::from_millis(150), session.next()).await;
+    session.pause(Duration::from_millis(300));
+    assert!(matches!(next(&mut session).await, Event::FetchDue));
+    let held = paused.elapsed();
+    assert!(held < Duration::from_millis(420), "held {held:?}");
+}
+
+/// The backlog: a real CPU worker at an easy target finds hits far faster
+/// than the node answers them. Hits on the old template are still being
+/// answered when the current template's first hit is: it is not queued
+/// behind them.
+#[tokio::test]
+async fn hits_on_an_old_template_do_not_hold_up_the_current_ones() {
+    #[derive(Default)]
+    struct Slow {
+        fetched: AtomicUsize,
+        old_in_flight: AtomicUsize,
+    }
+    impl NodeClient for Slow {
+        fn fetch_work(&self) -> BoxFuture<'_, Result<Option<Work>, Error>> {
+            async {
+                let n = self.fetched.fetch_add(1, Ordering::SeqCst);
+                let mut easy = [0xff; 32];
+                easy[0] = 0;
+                let mut hard = easy;
+                hard[1] = 0;
+                Ok(Some(Work {
+                    work_id: format!("w{n}"),
+                    block_hex: "00".into(),
+                    prefix: format!("prefix-w{n}").into_bytes(),
+                    target: easy,
+                    targets: vec![easy, hard],
+                    stale_token: format!("d{n}"),
+                }))
+            }
+            .boxed()
+        }
+        fn stale_token(&self) -> BoxFuture<'_, Result<Option<String>, Error>> {
+            async { Ok(None) }.boxed()
+        }
+        fn submit(&self, id: String, _: u64) -> BoxFuture<'_, Result<Submission, Error>> {
+            async move {
+                let old = id == "w0";
+                if old {
+                    self.old_in_flight.fetch_add(1, Ordering::SeqCst);
+                }
+                let rtt = if old { 300 } else { 10 };
+                tokio::time::sleep(Duration::from_millis(rtt)).await;
+                if old {
+                    self.old_in_flight.fetch_sub(1, Ordering::SeqCst);
+                }
+                Ok(Submission {
+                    accepted: false,
+                    disposition: if old { "duplicate" } else { "childOnly" }.into(),
+                    tip_cid: None,
+                })
+            }
+            .boxed()
+        }
+    }
+    let node = Arc::new(Slow::default());
+    let (pushes, digests) = watch::channel(Some("d0".to_string()));
+    let mut session = Session::new(
+        node.clone(),
+        vec![Arc::new(CpuWorker) as Arc<dyn StreamWorker>],
+        Some(digests),
+        SessionOptions::default(),
+    );
+    next(&mut session).await;
+    assert_eq!(fetched(next(&mut session).await), "w0");
+    // w0's hits pile up.
+    let _ = tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            session.next().await;
+        }
+    })
+    .await;
+    pushes.send_replace(Some("d1".into()));
+    assert!(matches!(next(&mut session).await, Event::FetchDue));
+    assert_eq!(fetched(next(&mut session).await), "w1");
+    let fetched_at = tokio::time::Instant::now();
+    let answered = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Event::Submitted { work_id, .. } = session.next().await
+                && work_id == "w1"
+            {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        answered.is_ok(),
+        "no hit on the current template answered within 1 s"
+    );
+    assert!(fetched_at.elapsed() < Duration::from_secs(1));
+    assert!(node.old_in_flight.load(Ordering::SeqCst) > 0);
 }

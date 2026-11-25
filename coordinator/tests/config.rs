@@ -58,13 +58,6 @@ fn settings_are_checked_and_unknown_keys_refused() {
 #[test]
 fn pacing() {
     let config = parse(r#"{"minBlockIntervalSeconds":10,"roundDeadlineMultiplier":3}"#).unwrap();
-    assert_eq!(
-        config.pacing_hold(Duration::from_secs(4)),
-        Duration::from_secs(6)
-    );
-    assert_eq!(config.pacing_hold(Duration::from_secs(40)), Duration::ZERO);
-    assert_eq!(
-        parse("{}").unwrap().pacing_hold(Duration::ZERO),
-        Duration::ZERO
-    );
+    assert_eq!(config.pacing_hold(), Duration::from_secs(10));
+    assert_eq!(parse("{}").unwrap().pacing_hold(), Duration::ZERO);
 }

@@ -24,9 +24,8 @@ pub struct MinerConfig {
     /// local search filter; blocks still commit their scheduled target.
     #[serde(default, deserialize_with = "unique_keys")]
     pub min_work: Option<BTreeMap<String, String>>,
-    /// Shortest gap between the template fetches that led to two parent
-    /// blocks. A floor, never a ceiling: a block found later waits not at
-    /// all.
+    /// Shortest gap between an accepted parent block and the template the
+    /// next one is mined on. A floor, never a ceiling.
     pub min_block_interval_seconds: Option<u64>,
     /// How long a request to the node may take, a template request
     /// including the node building it.
@@ -113,14 +112,11 @@ impl MinerConfig {
         )
     }
 
-    /// How long to idle the workers so that parent blocks are at least
-    /// `minBlockIntervalSeconds` apart, given how long ago the template that
-    /// just produced one was fetched: a block's timestamp is fixed when its
-    /// template is built.
-    pub fn pacing_hold(&self, elapsed: Duration) -> Duration {
-        self.min_block_interval_seconds
-            .map(|s| Duration::from_secs(s).saturating_sub(elapsed))
-            .unwrap_or_default()
+    /// How long to idle the workers after a parent block is accepted, so
+    /// that the next one (its timestamp fixed when its template is built) is
+    /// at least `minBlockIntervalSeconds` later.
+    pub fn pacing_hold(&self) -> Duration {
+        Duration::from_secs(self.min_block_interval_seconds.unwrap_or(0))
     }
 }
 

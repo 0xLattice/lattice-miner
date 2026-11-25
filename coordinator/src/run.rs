@@ -89,10 +89,14 @@ fn workers(config: &MinerConfig) -> Vec<Arc<dyn StreamWorker>> {
         .collect()
 }
 
-/// Mines until `cancel`. Fails only when the first read of the settings or
-/// the node URL does not check; after that every failure is logged and
-/// mining goes on.
-pub async fn run(options: RunOptions, cancel: CancellationToken) -> Result<(), String> {
+/// Mines until `cancel`, then submits every hit found unless `force` comes
+/// first. Fails only when the first read of the settings or the node URL
+/// does not check; after that every failure is logged and mining goes on.
+pub async fn run(
+    options: RunOptions,
+    cancel: CancellationToken,
+    force: CancellationToken,
+) -> Result<(), String> {
     let mut config = MinerConfig::load(&options.config)?;
     let client = |config: &MinerConfig| {
         HttpNodeClient::new(
@@ -126,7 +130,6 @@ pub async fn run(options: RunOptions, cancel: CancellationToken) -> Result<(), S
             ..Default::default()
         },
     );
-    let mut template_at = Instant::now();
     let mut without_template_since: Option<Instant> = None;
     let mut logged_recipients = None;
     let mut warned_unpaid: Vec<String> = vec![];
@@ -176,10 +179,7 @@ pub async fn run(options: RunOptions, cancel: CancellationToken) -> Result<(), S
                     warned_unpaid = unpaid;
                 }
                 match fetched {
-                    Ok(Some(_)) => {
-                        template_at = Instant::now();
-                        without_template_since = None;
-                    }
+                    Ok(Some(_)) => without_template_since = None,
                     Err(e @ Error::Unauthorized(_)) => log(format!(
                         "the node refused the miner ({e}); check the token or cookie; retrying"
                     )),
@@ -203,8 +203,10 @@ pub async fn run(options: RunOptions, cancel: CancellationToken) -> Result<(), S
                 nonce,
                 result,
             } => {
-                if log_submitted(&work_id, nonce, &result) {
-                    let hold = config.pacing_hold(template_at.elapsed());
+                // Measured from the parent block's acceptance; a hold running
+                // already is not extended.
+                if log_submitted(&work_id, nonce, &result) && !session.paused() {
+                    let hold = config.pacing_hold();
                     if !hold.is_zero() {
                         log(format!(
                             "pacing: holding {}s so the next parent block is at least minBlockIntervalSeconds from this one",
@@ -220,16 +222,22 @@ pub async fn run(options: RunOptions, cancel: CancellationToken) -> Result<(), S
         }
     }
     // A found block is not dropped on shutdown: the workers stop, and every
-    // hit they found is submitted first.
-    for event in session.finish().await {
-        if let Event::Submitted {
-            work_id,
-            nonce,
-            result,
-        } = event
-        {
-            log_submitted(&work_id, nonce, &result);
+    // hit they found is submitted first, unless asked again to stop.
+    log("stopping: submitting what the workers have found (signal again to stop now)");
+    tokio::select! {
+        events = session.finish() => {
+            for event in events {
+                if let Event::Submitted {
+                    work_id,
+                    nonce,
+                    result,
+                } = event
+                {
+                    log_submitted(&work_id, nonce, &result);
+                }
+            }
         }
+        _ = force.cancelled() => log("stopped without waiting"),
     }
     log("mining stopped");
     Ok(())

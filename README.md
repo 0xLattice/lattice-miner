@@ -61,8 +61,9 @@ Its settings are its own file, never the node's (default `miner.json`):
   miner neither searches for nor submits hashes below it; blocks still commit
   their scheduled target.
 - `minBlockIntervalSeconds`: a floor on the spacing of parent blocks, measured
-  from the latest template fetch: after a parent block the workers idle (their
-  processes kept) until it has passed.
+  from a parent block's acceptance: after one the workers idle (their
+  processes kept) until it has passed, and another accepted meanwhile does
+  not extend the hold.
 - `templateTimeoutSeconds` (1 to 60, default 60): how long one request to the
   node may take, a template request including the node building it.
 - `roundDeadlineMultiplier` is accepted and unused: nothing is searched in
@@ -78,21 +79,23 @@ follows `GET /mining/events`, and each pushed template digest other than the
 one it has leads to one template fetch, never more than one at a time; when a
 fetch returns, it fetches again only if the newest pushed digest differs. The
 workers keep hashing the job they have while the fetch is in flight, and the
-new template becomes their next job. Every hit is submitted, one at a time and
-in order, including hits on a template since replaced: a block solved on an old
-tip is still a valid block whose work counts. A hit that clears only some of
+new template becomes their next job. Every hit is submitted the moment it
+arrives, including hits on a template since replaced (a block solved on an old
+tip is still a valid block whose work counts); submissions run side by side, as
+a pool takes shares, and each answer is acted on as it comes, so old hits never
+hold up the current template's. A hit that clears only some of
 the template's targets (a child chain's, `childOnly`) moves the same work on
 to the next harder target, keeping its place in the nonces; an accepted block
 idles the workers until the next template; a `duplicate` changes nothing; any
-other refusal fetches a template at once. Hits are queued while one is being
-submitted, so a worker never waits to hand one over. A dropped stream says
+other refusal fetches a template at once. A worker started again after a
+failure resumes after its last hit. A dropped stream says
 nothing about the chain: the search goes on, `GET /status` is polled every
 2 s meanwhile, and the stream is opened again after a wait doubling from
 250 ms to 5 s. A submission that fails in transit (no answer, HTTP 5xx) is
 retried up to 3 times. A failed template fetch or a failed worker is logged
 and retried after 5 s. SIGINT or SIGTERM stops the miner: the workers stop
-after the chunk they are on, and every hit they found is submitted first. The
-recipients in effect are logged at
+after the chunk they are on, and every hit they found is submitted first; a
+second signal stops it at once. The recipients in effect are logged at
 start and whenever they change, with a warning when none are named or a
 template mines a chain with none. `lattice-miner check --config miner.json`
 exits 0 if `run` would accept the file and 2 with the reason if not.
