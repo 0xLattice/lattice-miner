@@ -10,7 +10,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 /// How the miner proves itself to the node. The file is read once, and
-/// again after the node answers 401, so a replaced token, or the new cookie
+/// again after the node answers 401 or 403, so a replaced token, or the new cookie
 /// a restarted node writes, applies from the next request (the bitcoin-cli
 /// way). A file that cannot be read fails the request: none goes out
 /// without the credentials asked for.
@@ -155,7 +155,10 @@ impl HttpNodeClient {
             request = request.header(reqwest::header::AUTHORIZATION, header);
         }
         let response = request.send().await?;
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
             // A restarted node writes a new cookie: read it again.
             *self.header.write().unwrap() = None;
         }

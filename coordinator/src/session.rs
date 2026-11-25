@@ -299,16 +299,18 @@ impl Session {
     }
 
     /// The first hit queued was answered: it leaves the queue, and the next
-    /// is submitted. One that failed stays first and is sent again after the
-    /// retry wait (the node answers a repeat as a duplicate).
+    /// is submitted. One that failed goes to the back, sent again after the
+    /// retry wait (the node answers a repeat as a duplicate): never dropped,
+    /// and a hit the node fails on every time holds up no other.
     fn answered(&mut self, result: Result<Submission, Error>) -> Event {
-        let hit = if result.is_ok() {
-            self.queue.pop_front()
-        } else {
+        let hit = self
+            .queue
+            .pop_front()
+            .expect("the hit submitted is first in the queue");
+        if result.is_err() {
             self.resubmit_at = Some(Instant::now() + self.options.retry_wait);
-            self.queue.front().cloned()
+            self.queue.push_back(hit.clone());
         }
-        .expect("the hit submitted is first in the queue");
         self.submitted(&hit, &result);
         self.submit_next();
         Event::Submitted {
@@ -410,45 +412,47 @@ impl Session {
         }
     }
 
-    /// An accepted block idles the work searched until the next template;
-    /// a refusal other than child-only or duplicate fetches one at once.
-    /// (The hit itself already moved the search on: see [`Session::found`].)
+    /// An accepted block, or a refusal other than child-only or duplicate
+    /// of a hit on the work searched, idles that work and fetches a
+    /// template at once: the template decides what is searched next, from
+    /// its own target, so a refused hit's raise does not stand. (A hit
+    /// itself moves the search on: see [`Session::found`].)
     fn submitted(&mut self, hit: &StreamHit, result: &Result<Submission, Error>) {
         let Ok(submission) = result else { return };
         let current = self
             .current
             .clone()
             .filter(|(work, _)| work.work_id == hit.work_id);
+        let refused = !submission.accepted
+            && !matches!(submission.disposition.as_str(), "duplicate" | "childOnly");
         if submission.accepted {
             // The tip moved.
             self.due = true;
-            // Idled already when the hit cleared every target.
-            if let Some((work, target)) = current
-                && target != IDLE
-            {
-                self.search(work, IDLE);
-            }
+        } else if refused && current.is_some() {
+            // The node will not take this work's hits.
+            self.due = true;
+        } else {
             return;
         }
-        if current.is_some()
-            && !matches!(submission.disposition.as_str(), "duplicate" | "childOnly")
+        // Idled already when the hit cleared every target.
+        if let Some((work, target)) = current
+            && target != IDLE
         {
-            // The node will not take this work's hits: a template now.
-            self.due = true;
+            self.search(work, IDLE);
         }
     }
 
     /// Stops the workers and submits every hit they have found, those still
-    /// to come as they stop included, in order. Returns what each
-    /// submission answered, failures included: a hit that fails is sent
-    /// again until it is answered. Dropping it stops at once: the workers
-    /// are killed, and hits not yet answered are abandoned.
-    pub async fn finish(mut self) -> Vec<Event> {
+    /// to come as they stop included, in order, handing `answered` each
+    /// answer as it comes. Submitting stops at the first that fails its
+    /// retries (the node is gone, say): what was not sent is returned.
+    /// Dropping it stops at once: the workers are killed, and hits not yet
+    /// answered are abandoned.
+    pub async fn finish(mut self, mut answered: impl FnMut(Event)) -> Vec<StreamHit> {
         // Their jobs closed, the workers stop after the chunk they are on.
         self.running.clear();
-        let mut answered = vec![];
-        let mut stopped = false;
-        while !stopped || !self.queue.is_empty() {
+        let (mut stopped, mut failed) = (false, false);
+        while !stopped || !(failed || self.queue.is_empty()) {
             tokio::select! {
                 joined = self.tasks.join_next(), if !stopped => if joined.is_none() {
                     stopped = true;
@@ -457,14 +461,18 @@ impl Session {
                     }
                 },
                 Some(hit) = self.hits.recv(), if !stopped => self.found(hit),
-                result = poll(&mut self.submitting) => answered.push(self.answered(result)),
-                _ = until(self.resubmit_at) => {
+                result = poll(&mut self.submitting) => {
+                    // A failure leaves a resubmission waiting: nothing more is sent.
+                    failed |= result.is_err();
+                    answered(self.answered(result));
+                }
+                _ = until(self.resubmit_at), if !failed => {
                     self.resubmit_at = None;
                     self.submit_next();
                 }
             }
         }
-        answered
+        std::mem::take(&mut self.queue).into()
     }
 }
 

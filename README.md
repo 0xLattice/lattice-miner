@@ -21,7 +21,7 @@ lattice-miner run --node http://127.0.0.1:8080 --cookie-file <root>/chains/Nexus
 `--node` is a node's remote operator listener with a bearer token
 (`--token-file`), or its loopback API with the cookie it writes at every start
 (`--cookie-file`). Either file is read once, and again after the node answers
-401 (as a restarted node's new cookie makes it); a file that cannot be read
+401 or 403 (as a restarted node's new cookie makes it); a file that cannot be read
 fails the request rather than sending it without. A token for
 mining needs `POST /mining/templates`, `POST /mining/work` and `GET /status`,
 and `GET /mining/events` to be pushed template changes rather than poll for
@@ -89,16 +89,19 @@ hit moves the same work on to the next harder target it does not clear,
 keeping its place in the nonces, or idles the workers when it clears them all
 (the share-target rule): the workers look only for what no hit has cleared.
 An accepted block idles the workers until the next template; `childOnly` and
-`duplicate` change nothing; any other refusal fetches a template at once. A worker started again after a
+`duplicate` change nothing; any other refusal idles the work and fetches a
+template at once, searched from its own target. A worker started again after a
 failure resumes after its last hit. A dropped stream says
 nothing about the chain: the search goes on, `GET /status` is polled every
 2 s meanwhile, and the stream is opened again after a wait doubling from
 250 ms to 5 s. A submission that fails in transit (no answer, HTTP 5xx, 401) is
-retried up to 3 times, then sent again every 5 s, ahead of the hits queued
-behind it: no hit is dropped. A failed template fetch or a failed worker is logged
+retried up to 3 times, then sent again after 5 s, behind the hits queued since:
+no hit is dropped, and one the node fails on every time holds up no other. A failed template fetch or a failed worker is logged
 and retried after 5 s. SIGINT or SIGTERM stops the miner: the workers stop
-after the chunk they are on, and every hit they found is submitted first; a
-second signal stops it at once. The recipients in effect are logged at
+after the chunk they are on, and every hit they found is submitted first, each
+answer logged as it comes; if a submission fails its retries, the rest are
+logged as not submitted rather than waited on. A second signal stops it at
+once. The recipients in effect are logged at
 start and whenever they change, with a warning when none are named or a
 template mines a chain with none. `lattice-miner check --config miner.json`
 exits 0 if `run` would accept the file and 2 with the reason if not.

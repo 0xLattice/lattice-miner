@@ -334,17 +334,18 @@ async fn every_hit_is_submitted_one_at_a_time_in_order_old_work_included() {
     assert_eq!(node.most_in_flight.load(Ordering::SeqCst), 1);
 }
 
-/// A submission that fails in transit is sent again, first in line: no hit
-/// is lost, the order holds, and only one is ever in flight.
+/// A submission that fails in transit is sent again behind the hits queued
+/// since: no hit is lost, one that keeps failing holds up no other, and only
+/// one is ever in flight.
 #[tokio::test]
-async fn a_failed_submission_is_sent_again_before_the_next_hit() {
+async fn a_failed_submission_is_sent_again_behind_the_hits_queued() {
     let node = Node::new(vec![work("w1", "d1")]);
     let workers = Arc::new(Workers::default());
     let (mut session, _pushes) = session(&node, &workers, 1);
     node.gate.add_permits(1);
     next(&mut session).await;
     assert_eq!(fetched(next(&mut session).await), "w1");
-    // More failures than one submission's quick retries (3).
+    // One more failure than one submission's attempts (1 + 3 retries).
     node.failing_submits.store(5, Ordering::SeqCst);
     let found: Vec<u64> = (0..3).map(|i| nonce("w1", HARD, EASY, i)).collect();
     hits(
@@ -363,16 +364,64 @@ async fn a_failed_submission_is_sent_again_before_the_next_hit() {
         answered,
         vec![
             (found[0], false),
-            (found[0], true),
             (found[1], true),
-            (found[2], true)
+            (found[2], true),
+            (found[0], true)
         ]
     );
     let attempts: Vec<u64> = node.submits().into_iter().map(|(_, n)| n).collect();
     assert_eq!(
         attempts,
-        [vec![found[0]; 6], vec![found[1], found[2]]].concat()
+        [
+            vec![found[0]; 4],
+            vec![found[1]; 2],
+            vec![found[2], found[0]]
+        ]
+        .concat()
     );
+    assert_eq!(node.most_in_flight.load(Ordering::SeqCst), 1);
+}
+
+/// The live failure: every submission fails, and the hits keep coming. Each
+/// still moves the search on, so the worker is not left finding hits at the
+/// easiest target, and each is tried in turn.
+#[tokio::test]
+async fn while_submissions_fail_each_hit_still_moves_the_search_on() {
+    let node = Node::new(vec![work("w1", "d1")]);
+    let workers = Arc::new(Workers::default());
+    let (mut session, _pushes) = session(&node, &workers, 1);
+    node.gate.add_permits(1);
+    next(&mut session).await;
+    assert_eq!(fetched(next(&mut session).await), "w1");
+    node.failing_submits.store(usize::MAX, Ordering::SeqCst);
+    let (child, parent) = (nonce("w1", HARD, EASY, 0), nonce("w1", [0; 32], HARD, 0));
+    hits(&workers, 0, &[("w1", child)]);
+    let _ = tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            assert!(!matches!(
+                next(&mut session).await,
+                Event::Submitted { result: Ok(_), .. }
+            ));
+        }
+    })
+    .await;
+    hits(&workers, 0, &[("w1", parent)]);
+    let _ = tokio::time::timeout(Duration::from_millis(300), async {
+        loop {
+            next(&mut session).await;
+        }
+    })
+    .await;
+    assert_eq!(
+        jobs(&workers).await,
+        vec![
+            (0, "w1".into(), EASY, 0),
+            (0, "w1".into(), HARD, 0),
+            (0, "w1".into(), [0; 32], 0),
+        ]
+    );
+    let attempts: Vec<u64> = node.submits().into_iter().map(|(_, n)| n).collect();
+    assert!(attempts.contains(&child) && attempts.contains(&parent));
     assert_eq!(node.most_in_flight.load(Ordering::SeqCst), 1);
 }
 
@@ -628,15 +677,23 @@ async fn a_duplicate_changes_nothing_and_a_refusal_fetches_at_once() {
     quiet(&mut session).await;
     hits(&workers, 0, &[("w1", b)]);
     assert_eq!(submitted(next(&mut session).await).2, "invalid");
-    // Not a transport failure: a template at once, and the search goes on
-    // (at the target the first hit moved it to).
+    // Not a transport failure: the work idles and a template is fetched at
+    // once, searched from its own target even as the same work: the
+    // refused hit's raise does not stand.
     let event = tokio::time::timeout(Duration::from_millis(20), session.next())
         .await
         .expect("a fetch due at once");
     assert!(matches!(event, Event::FetchDue));
+    session.fetch();
+    assert_eq!(fetched(next(&mut session).await), "w1");
     assert_eq!(
         jobs(&workers).await,
-        vec![(0, "w1".into(), EASY, 0), (0, "w1".into(), HARD, 0)]
+        vec![
+            (0, "w1".into(), EASY, 0),
+            (0, "w1".into(), HARD, 0),
+            (0, "w1".into(), [0; 32], 0),
+            (0, "w1".into(), EASY, 0)
+        ]
     );
 }
 
@@ -688,9 +745,14 @@ async fn finishing_submits_every_hit_already_found() {
         hash: String::new(),
     });
     node.hold_submits.store(false, Ordering::SeqCst);
-    let events = tokio::time::timeout(Duration::from_secs(5), session.finish())
-        .await
-        .expect("finished");
+    let mut events = vec![];
+    let unsent = tokio::time::timeout(
+        Duration::from_secs(5),
+        session.finish(|event| events.push(submitted(event).1)),
+    )
+    .await
+    .expect("finished");
+    assert!(unsent.is_empty());
     assert_eq!(events.len(), 4);
     let expected: Vec<_> = found
         .iter()
@@ -698,6 +760,43 @@ async fn finishing_submits_every_hit_already_found() {
         .map(|n| ("w1".to_string(), *n))
         .collect();
     assert_eq!(node.submits(), expected);
+}
+
+/// Stopping while the node is gone does not wait on it: submitting stops at
+/// the first hit that fails its retries, and what was not sent is returned.
+#[tokio::test]
+async fn finishing_with_the_node_gone_returns_what_was_not_sent() {
+    let node = Node::new(vec![work("w1", "d1")]);
+    let workers = Arc::new(Workers::default());
+    let (mut session, _pushes) = session(&node, &workers, 1);
+    node.gate.add_permits(1);
+    next(&mut session).await;
+    assert_eq!(fetched(next(&mut session).await), "w1");
+    node.failing_submits.store(usize::MAX, Ordering::SeqCst);
+    let found: Vec<u64> = (0..3).map(|i| nonce("w1", HARD, EASY, i)).collect();
+    hits(
+        &workers,
+        0,
+        &[("w1", found[0]), ("w1", found[1]), ("w1", found[2])],
+    );
+    let mut answers = vec![];
+    let unsent = tokio::time::timeout(
+        Duration::from_secs(2),
+        session.finish(|event| match event {
+            Event::Submitted { nonce, result, .. } => answers.push((nonce, result.is_ok())),
+            other => panic!("expected a submission, got {other:?}"),
+        }),
+    )
+    .await
+    .expect("finished without waiting on the node");
+    assert_eq!(answers, vec![(found[0], false)]);
+    let mut unsent: Vec<u64> = unsent.into_iter().map(|hit| hit.nonce).collect();
+    unsent.sort();
+    let mut expected = found.clone();
+    expected.sort();
+    assert_eq!(unsent, expected);
+    // One hit's attempts: 1 + 3 retries.
+    assert_eq!(node.submits().len(), 4);
 }
 
 /// The in-process worker idles on a zero target and goes on from where it

@@ -224,19 +224,17 @@ pub async fn run(
         }
     }
     // A found block is not dropped on shutdown: the workers stop, and every
-    // hit they found is submitted first, unless asked again to stop.
+    // hit they found is submitted first, unless asked again to stop or the
+    // node stops answering; a hit not sent is logged.
     log("stopping: submitting what the workers have found (signal again to stop now)");
     tokio::select! {
-        events = session.finish() => {
-            for event in events {
-                if let Event::Submitted {
-                    work_id,
-                    nonce,
-                    result,
-                } = event
-                {
-                    log_submitted(&work_id, nonce, &result);
-                }
+        unsent = session.finish(|event| {
+            if let Event::Submitted { work_id, nonce, result } = event {
+                log_submitted(&work_id, nonce, &result);
+            }
+        }) => {
+            for hit in unsent {
+                log(format!("not submitted: work {} nonce {}", hit.work_id, hit.nonce));
             }
         }
         _ = force.cancelled() => log("stopped without waiting"),
