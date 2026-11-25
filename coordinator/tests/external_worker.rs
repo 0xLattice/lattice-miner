@@ -15,6 +15,7 @@ async fn actual_external_worker_streams_every_hit() {
         target,
         targets: vec![target],
         stale_token: "fixed".into(),
+        ..Default::default()
     });
     let (jobs, receiver) = tokio::sync::mpsc::unbounded_channel();
     let (sender, mut hits) = tokio::sync::mpsc::unbounded_channel();

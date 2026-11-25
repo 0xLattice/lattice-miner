@@ -8,9 +8,12 @@
 //! over one kept-alive connection; a hit whose submission fails in transit
 //! is sent again, never dropped. A worker never waits to hand one over. A hit
 //! moves its work's search on to the next harder target it does not clear,
-//! so the workers look only for what no hit has cleared yet. Nothing here
-//! expires on a clock: only transport (a failed fetch or submission, a
-//! crashed worker) waits before trying again.
+//! so the workers look only for what no hit has cleared yet. That raise is
+//! carried across templates by chain and height, as a Stratum pool carries
+//! a share target across jobs: a block a hit made (the node took it) is not
+//! searched for again while templates offer its chain at the same height on
+//! the same root tip. Nothing here expires on a clock: only transport (a
+//! failed fetch or submission, a crashed worker) waits before trying again.
 use crate::*;
 use futures_util::{FutureExt, future::BoxFuture};
 use std::{
@@ -96,6 +99,11 @@ pub enum Event {
 /// No hash is at or below it: a worker given it idles where it is.
 const IDLE: Target = [0; 32];
 
+/// The works last searched, newest last: a hit on one of them the node
+/// takes marks the blocks it made. A hit on older work is submitted all the
+/// same and marks nothing.
+const RECENT_WORKS: usize = 8;
+
 type Pending<T> = Option<BoxFuture<'static, T>>;
 
 pub struct Session {
@@ -111,6 +119,13 @@ pub struct Session {
     hit_sender: mpsc::UnboundedSender<StreamHit>,
     /// The work searched, and the target the workers search it at.
     current: Option<(Arc<Work>, Target)>,
+    /// See [`RECENT_WORKS`].
+    recent: VecDeque<Arc<Work>>,
+    /// The root tip the last template built on.
+    tip: Option<String>,
+    /// Per chain below the root, the height a hit of ours made a block at,
+    /// on `tip`: not searched for while a template offers that height.
+    made: BTreeMap<String, u64>,
     pushed: Option<String>,
     fetched: Option<String>,
     due: bool,
@@ -150,6 +165,9 @@ impl Session {
             hits,
             hit_sender,
             current: None,
+            recent: VecDeque::new(),
+            tip: None,
+            made: BTreeMap::new(),
             pushed: None,
             fetched: None,
             due: true,
@@ -275,14 +293,88 @@ impl Session {
                 self.resume.insert(worker, hit.nonce.wrapping_add(1));
             }
             let hash = lattice_pow::hash(&work.prefix, hit.nonce);
-            let harder = work.targets.iter().copied().find(|t| *t < hash);
-            let next = harder.unwrap_or(IDLE).min(target);
+            let next = self.unmade(&work, Some(hash)).min(target);
             if next < target {
                 self.search(work, next);
             }
         }
         self.queue.push_back(hit);
         self.submit_next();
+    }
+
+    /// The easiest threshold of `work` a block not yet made needs, below
+    /// `cleared` (a hit's hash) when given; [`IDLE`] when there is none. A
+    /// block is made when a template offers its chain at the height a hit
+    /// of ours made one at, or when `cleared` is at or below its target.
+    /// The root's block is always searched for: a root block moves the tip,
+    /// which every mark is cleared by, so the search never stops for good.
+    fn unmade(&self, work: &Work, cleared: Option<Target>) -> Target {
+        let below = |t: &Target| cleared.is_none_or(|h| *t < h);
+        if work.chains.is_empty() {
+            // A node that does not say each block's height: by target alone.
+            return work.targets.iter().copied().find(below).unwrap_or(IDLE);
+        }
+        work.chains
+            .iter()
+            .filter(|c| c.root || self.made.get(&c.path) != Some(&c.height))
+            .filter(|c| below(&c.target))
+            // The node's threshold for it (a minimum work may bind below
+            // the committed target), the search target at most.
+            .map(|c| {
+                let threshold = work.targets.iter().copied().find(|t| *t <= c.target);
+                threshold.unwrap_or(c.target.min(work.target))
+            })
+            .max()
+            .unwrap_or(IDLE)
+    }
+
+    /// A template arrived: marks on another root tip, or for a chain it
+    /// offers at another height (our block executed, or was reorganized
+    /// away), no longer hold.
+    fn offered(&mut self, work: &Arc<Work>) {
+        if self.tip.as_ref() != Some(&work.tip) {
+            self.made.clear();
+            self.tip = Some(work.tip.clone());
+        }
+        for chain in &work.chains {
+            if self
+                .made
+                .get(&chain.path)
+                .is_some_and(|h| *h != chain.height)
+            {
+                self.made.remove(&chain.path);
+            }
+        }
+        if self.recent.len() == RECENT_WORKS {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(work.clone());
+    }
+
+    /// The node took `hit`: every block below the root it cleared is made,
+    /// when its work built on the current tip.
+    fn mark(&mut self, hit: &StreamHit) {
+        let Some(work) = self
+            .recent
+            .iter()
+            .rev()
+            .find(|w| w.work_id == hit.work_id && Some(&w.tip) == self.tip.as_ref())
+            .cloned()
+        else {
+            return;
+        };
+        let hash = lattice_pow::hash(&work.prefix, hit.nonce);
+        for chain in work.chains.iter().filter(|c| !c.root && hash <= c.target) {
+            self.made.insert(chain.path.clone(), chain.height);
+        }
+        // The work searched may offer what was just made: it moves on now,
+        // not at the next template.
+        if let Some((work, target)) = self.current.clone() {
+            let next = self.unmade(&work, None).min(target);
+            if next < target {
+                self.search(work, next);
+            }
+        }
     }
 
     /// Submits the first hit queued, unless a submission is in flight or
@@ -369,8 +461,9 @@ impl Session {
                             // The same work goes on where it is, unless it
                             // was idled: then it is searched again.
                             let going = self.current.as_ref().is_some_and(|(w, t)| w.work_id == work.work_id && *t != IDLE);
+                            self.offered(work);
                             if !going && self.paused_until.is_none() {
-                                self.search(work.clone(), work.target);
+                                self.search(work.clone(), self.unmade(work, None));
                             }
                         }
                         _ => self.retry_fetch_at = Some(Instant::now() + self.options.retry_wait),
@@ -419,6 +512,11 @@ impl Session {
     /// itself moves the search on: see [`Session::found`].)
     fn submitted(&mut self, hit: &StreamHit, result: &Result<Submission, Error>) {
         let Ok(submission) = result else { return };
+        if submission.accepted
+            || matches!(submission.disposition.as_str(), "duplicate" | "childOnly")
+        {
+            self.mark(hit);
+        }
         let current = self
             .current
             .clone()

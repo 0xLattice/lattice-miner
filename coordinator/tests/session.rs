@@ -31,6 +31,7 @@ fn work(id: &str, digest: &str) -> Work {
         target: EASY,
         targets: vec![EASY, HARD],
         stale_token: digest.into(),
+        ..Default::default()
     }
 }
 
@@ -538,6 +539,178 @@ async fn a_hit_searches_the_same_work_harder_and_a_parent_block_ends_it() {
     );
 }
 
+/// A template committing the root (at `HARD`) and two children, `K` (at
+/// `EASY`) and `J` (at `MID`), on root tip `tip`, `K` and `J` at `heights`.
+fn chained(id: &str, digest: &str, tip: &str, heights: [u64; 2]) -> Work {
+    let chain = |path: &str, target, height, root| WorkChain {
+        path: path.into(),
+        target,
+        height,
+        root,
+    };
+    Work {
+        targets: vec![EASY, MID, HARD],
+        chains: vec![
+            chain("Nexus", HARD, 10, true),
+            chain("Nexus/K", EASY, heights[0], false),
+            chain("Nexus/J", MID, heights[1], false),
+        ],
+        tip: tip.into(),
+        ..work(id, digest)
+    }
+}
+
+const MID: Target = {
+    let mut t = [0xff; 32];
+    t[0] = 0x3f;
+    t
+};
+
+/// The live failure: every template restarted at the easiest target, so the
+/// child block the node reuses across templates was found and submitted
+/// again and again. A block the node took is not searched for while
+/// templates offer its chain at that height; once the height moves it is.
+/// Every hit found is still submitted, one on old work included.
+#[tokio::test]
+async fn a_height_already_made_is_not_searched_again_until_it_moves() {
+    let node = Node::new(vec![
+        chained("w1", "d1", "T", [5, 7]),
+        chained("w2", "d2", "T", [5, 7]),
+        chained("w3", "d3", "T", [6, 7]),
+    ]);
+    let workers = Arc::new(Workers::default());
+    let (mut session, pushes) = session(&node, &workers, 1);
+    node.gate.add_permits(3);
+    next(&mut session).await;
+    assert_eq!(fetched(next(&mut session).await), "w1");
+    let k = nonce("w1", MID, EASY, 0);
+    hits(&workers, 0, &[("w1", k)]);
+    assert_eq!(
+        submitted(next(&mut session).await),
+        ("w1".into(), k, "childOnly".into())
+    );
+    // A new template offering K at the height made: J and the root only.
+    pushes.send_replace(Some("d2".into()));
+    assert!(matches!(next(&mut session).await, Event::FetchDue));
+    assert_eq!(fetched(next(&mut session).await), "w2");
+    // Found on the old work before the worker took the new job: submitted.
+    let old = nonce("w1", MID, EASY, 1);
+    hits(&workers, 0, &[("w1", old)]);
+    assert_eq!(
+        submitted(next(&mut session).await),
+        ("w1".into(), old, "childOnly".into())
+    );
+    // K's height moved (our block executed): searched for again.
+    pushes.send_replace(Some("d3".into()));
+    assert!(matches!(next(&mut session).await, Event::FetchDue));
+    assert_eq!(fetched(next(&mut session).await), "w3");
+    assert_eq!(
+        jobs(&workers).await,
+        vec![
+            (0, "w1".into(), EASY, 0),
+            (0, "w1".into(), MID, 0),
+            (0, "w2".into(), MID, 0),
+            (0, "w3".into(), EASY, 0),
+        ]
+    );
+    assert_eq!(node.submits(), vec![("w1".into(), k), ("w1".into(), old)]);
+}
+
+/// Every child made, the root's block is still searched for (a root block
+/// moves the tip); a new root tip clears every mark.
+#[tokio::test]
+async fn the_root_is_always_searched_and_a_new_root_tip_clears_every_mark() {
+    let node = Node::new(vec![
+        chained("w1", "d1", "T", [5, 7]),
+        chained("w2", "d2", "T", [5, 7]),
+        chained("w3", "d3", "T2", [5, 7]),
+    ]);
+    let workers = Arc::new(Workers::default());
+    let (mut session, pushes) = session(&node, &workers, 1);
+    node.gate.add_permits(3);
+    next(&mut session).await;
+    assert_eq!(fetched(next(&mut session).await), "w1");
+    let both = nonce("w1", HARD, MID, 0);
+    hits(&workers, 0, &[("w1", both)]);
+    submitted(next(&mut session).await);
+    pushes.send_replace(Some("d2".into()));
+    next(&mut session).await;
+    assert_eq!(fetched(next(&mut session).await), "w2");
+    pushes.send_replace(Some("d3".into()));
+    next(&mut session).await;
+    assert_eq!(fetched(next(&mut session).await), "w3");
+    assert_eq!(
+        jobs(&workers).await,
+        vec![
+            (0, "w1".into(), EASY, 0),
+            (0, "w1".into(), HARD, 0),
+            (0, "w2".into(), HARD, 0),
+            (0, "w3".into(), EASY, 0),
+        ]
+    );
+}
+
+/// A busy node answers after the next template is out: the work searched
+/// moves past the block made as the answer comes, not a template later.
+#[tokio::test]
+async fn a_block_made_moves_the_work_searched_on_as_the_answer_comes() {
+    let node = Node::new(vec![
+        chained("w1", "d1", "T", [5, 7]),
+        chained("w2", "d2", "T", [5, 7]),
+    ]);
+    let workers = Arc::new(Workers::default());
+    let (mut session, pushes) = session(&node, &workers, 1);
+    node.gate.add_permits(2);
+    next(&mut session).await;
+    assert_eq!(fetched(next(&mut session).await), "w1");
+    node.hold_submits.store(true, Ordering::SeqCst);
+    let k = nonce("w1", MID, EASY, 0);
+    hits(&workers, 0, &[("w1", k)]);
+    pushes.send_replace(Some("d2".into()));
+    assert!(matches!(next(&mut session).await, Event::FetchDue));
+    assert_eq!(fetched(next(&mut session).await), "w2");
+    node.hold_submits.store(false, Ordering::SeqCst);
+    submitted(next(&mut session).await);
+    assert_eq!(
+        jobs(&workers).await,
+        vec![
+            (0, "w1".into(), EASY, 0),
+            (0, "w1".into(), MID, 0),
+            (0, "w2".into(), EASY, 0),
+            (0, "w2".into(), MID, 0),
+        ]
+    );
+}
+
+/// Only a block the node took is marked: after a refusal the next template
+/// is searched from its easiest target.
+#[tokio::test]
+async fn a_refused_hit_marks_nothing() {
+    let node = Node::new(vec![
+        chained("w1", "d1", "T", [5, 7]),
+        chained("w2", "d2", "T", [5, 7]),
+    ]);
+    let workers = Arc::new(Workers::default());
+    let (mut session, _pushes) = session(&node, &workers, 1);
+    node.gate.add_permits(2);
+    next(&mut session).await;
+    assert_eq!(fetched(next(&mut session).await), "w1");
+    node.answers.lock().unwrap().push_back("invalid");
+    hits(&workers, 0, &[("w1", nonce("w1", MID, EASY, 0))]);
+    submitted(next(&mut session).await);
+    assert!(matches!(next(&mut session).await, Event::FetchDue));
+    assert_eq!(fetched(next(&mut session).await), "w2");
+    assert_eq!(
+        jobs(&workers).await,
+        vec![
+            (0, "w1".into(), EASY, 0),
+            (0, "w1".into(), MID, 0),
+            (0, "w1".into(), [0; 32], 0),
+            (0, "w2".into(), EASY, 0),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn a_failed_worker_is_started_again_with_the_current_job() {
     let node = Node::new(vec![work("w1", "d1")]);
@@ -880,6 +1053,7 @@ async fn a_slow_node_is_not_flooded_with_hits() {
                     target: target(1),
                     targets: vec![target(1), target(2), target(3)],
                     stale_token: "d0".into(),
+                    ..Default::default()
                 }))
             }
             .boxed()
@@ -1026,6 +1200,7 @@ mod out_of_order {
             target: t(0x7f),
             targets: vec![t(0x7f), t(0x3f), t(0x0f)],
             stale_token: d.into(),
+            ..Default::default()
         }
     }
     fn nonce(id: &str, above: Target, at_most: Target) -> u64 {

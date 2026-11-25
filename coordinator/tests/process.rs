@@ -9,6 +9,7 @@ fn work() -> Arc<Work> {
         target: [255; 32],
         targets: vec![[255; 32]],
         stale_token: "stable".into(),
+        ..Default::default()
     })
 }
 /// `--stream`: the job line the worker reads, the hit it prints, and how it

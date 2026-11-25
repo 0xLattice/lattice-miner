@@ -89,6 +89,11 @@ pub struct TemplateResponse {
 pub struct TemplateChain {
     pub chain_path: Vec<String>,
     pub reward_recipient: Option<String>,
+    /// The block's committed target and height (a decimal string).
+    #[serde(default)]
+    pub target: Option<lattice_primitives::UInt256>,
+    #[serde(default)]
+    pub height: Option<String>,
 }
 impl TemplateResponse {
     /// The template's chains that pay no one: their reward and fees burn.
@@ -101,7 +106,7 @@ impl TemplateResponse {
     }
 }
 /// Immutable assignment data, constructed only after canonical block encoding.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Work {
     pub work_id: String,
     pub block_hex: String,
@@ -109,6 +114,22 @@ pub struct Work {
     pub target: Target,
     pub targets: Vec<Target>,
     pub stale_token: String,
+    /// Every block a nonce for this work can make, the root's first; empty
+    /// when the node does not say each one's target and height.
+    pub chains: Vec<WorkChain>,
+    /// The root block's parent: the tip this work builds on.
+    pub tip: String,
+}
+/// One block a work commits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkChain {
+    /// The chain's absolute path, `/`-joined.
+    pub path: String,
+    /// Its committed target: a hash at or below it makes this block.
+    pub target: Target,
+    pub height: u64,
+    /// The template's own chain.
+    pub root: bool,
 }
 impl TryFrom<TemplateResponse> for Work {
     type Error = Error;
@@ -124,6 +145,19 @@ impl TryFrom<TemplateResponse> for Work {
             .filter(|x| *x <= target)
             .collect();
         targets.insert(target);
+        let chains = t
+            .chains
+            .iter()
+            .map(|c| {
+                Some(WorkChain {
+                    path: c.chain_path.join("/"),
+                    target: c.target.as_ref()?.0,
+                    height: c.height.as_deref()?.parse().ok()?,
+                    root: c.chain_path == t.chain_path,
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default();
         Ok(Self {
             work_id: t.work_id,
             block_hex: hex::encode(lattice_cashew::cbor::encode(&t.block)?),
@@ -131,6 +165,13 @@ impl TryFrom<TemplateResponse> for Work {
             target,
             targets: targets.into_iter().rev().collect(),
             stale_token: t.template_digest,
+            chains,
+            tip: t
+                .block
+                .parent
+                .as_ref()
+                .map(|p| p.0.raw_cid.clone())
+                .unwrap_or_default(),
         })
     }
 }

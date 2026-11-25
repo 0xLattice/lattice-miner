@@ -383,3 +383,50 @@ async fn only_a_new_tip_is_paced() {
         );
     }
 }
+
+/// A template's chains with their committed targets and heights, and the
+/// root tip it builds on, as the session reads them; a node that leaves a
+/// height out leaves the session searching by target alone.
+#[test]
+fn a_template_says_each_blocks_height_and_the_tip_it_builds_on() {
+    use lattice_miner::{TemplateResponse, Work, WorkChain};
+    let parent = Volume::new(block()).unwrap();
+    let mut root = block();
+    root.parent = Some(parent.clone());
+    let template = |kid: serde_json::Value| -> Work {
+        serde_json::from_value::<TemplateResponse>(serde_json::json!({"workID":"w","block":root,"searchTarget":"0x3f","targets":["0x3f","0x0f"],"chainPath":["Nexus"],"chains":[{"chainPath":["Nexus"],"target":"0x0f","height":"10","rewardRecipient":"a"},kid],"expiresInMilliseconds":30000,"templateDigest":"d"}))
+            .unwrap()
+            .try_into()
+            .unwrap()
+    };
+    let target = |n: u8| {
+        let mut t = [0; 32];
+        t[31] = n;
+        t
+    };
+    let work =
+        template(serde_json::json!({"chainPath":["Nexus","Kid"],"target":"0x3f","height":"5"}));
+    assert_eq!(work.tip, parent.0.raw_cid);
+    assert_eq!(
+        work.chains,
+        vec![
+            WorkChain {
+                path: "Nexus".into(),
+                target: target(0x0f),
+                height: 10,
+                root: true
+            },
+            WorkChain {
+                path: "Nexus/Kid".into(),
+                target: target(0x3f),
+                height: 5,
+                root: false
+            },
+        ]
+    );
+    assert!(
+        template(serde_json::json!({"chainPath":["Nexus","Kid"]}))
+            .chains
+            .is_empty()
+    );
+}
