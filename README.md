@@ -20,7 +20,9 @@ lattice-miner run --node http://127.0.0.1:8080 --cookie-file <root>/chains/Nexus
 
 `--node` is a node's remote operator listener with a bearer token
 (`--token-file`), or its loopback API with the cookie it writes at every start
-(`--cookie-file`). Either file is read again for every request. A token for
+(`--cookie-file`). Either file is read once, and again after the node answers
+401 or 403 (as a restarted node's new cookie makes it); a file that cannot be read
+fails the request rather than sending it without. A token for
 mining needs `POST /mining/templates`, `POST /mining/work` and `GET /status`,
 and `GET /mining/events` to be pushed template changes rather than poll for
 them:
@@ -79,23 +81,27 @@ follows `GET /mining/events`, and each pushed template digest other than the
 one it has leads to one template fetch, never more than one at a time; when a
 fetch returns, it fetches again only if the newest pushed digest differs. The
 workers keep hashing the job they have while the fetch is in flight, and the
-new template becomes their next job. Every hit is submitted the moment it
-arrives, including hits on a template since replaced (a block solved on an old
-tip is still a valid block whose work counts); submissions run side by side, as
-a pool takes shares, and each answer is acted on as it comes, so old hits never
-hold up the current template's. A hit that clears only some of
-the template's targets (a child chain's, `childOnly`) moves the same work on
-to the next harder target, keeping its place in the nonces; an accepted block
-idles the workers until the next template; a `duplicate` changes nothing; any
-other refusal fetches a template at once. A worker started again after a
+new template becomes their next job. Every hit is submitted, including hits on
+a template since replaced (a block solved on an old tip is still a valid block
+whose work counts), as a pool takes shares: one at a time, in the order found,
+over one kept-alive connection, so a busy node is never asked side by side. A
+hit moves the same work on to the next harder target it does not clear,
+keeping its place in the nonces, or idles the workers when it clears them all
+(the share-target rule): the workers look only for what no hit has cleared.
+An accepted block idles the workers until the next template; `childOnly` and
+`duplicate` change nothing; any other refusal idles the work and fetches a
+template at once, searched from its own target. A worker started again after a
 failure resumes after its last hit. A dropped stream says
 nothing about the chain: the search goes on, `GET /status` is polled every
 2 s meanwhile, and the stream is opened again after a wait doubling from
-250 ms to 5 s. A submission that fails in transit (no answer, HTTP 5xx) is
-retried up to 3 times. A failed template fetch or a failed worker is logged
+250 ms to 5 s. A submission that fails in transit (no answer, HTTP 5xx, 401) is
+retried up to 3 times, then sent again after 5 s, behind the hits queued since:
+no hit is dropped, and one the node fails on every time holds up no other. A failed template fetch or a failed worker is logged
 and retried after 5 s. SIGINT or SIGTERM stops the miner: the workers stop
-after the chunk they are on, and every hit they found is submitted first; a
-second signal stops it at once. The recipients in effect are logged at
+after the chunk they are on, and every hit they found is submitted first, each
+answer logged as it comes; if a submission fails its retries, the rest are
+logged as not submitted rather than waited on. A second signal stops it at
+once. The recipients in effect are logged at
 start and whenever they change, with a warning when none are named or a
 template mines a chain with none. `lattice-miner check --config miner.json`
 exits 0 if `run` would accept the file and 2 with the reason if not.

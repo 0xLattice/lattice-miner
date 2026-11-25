@@ -9,9 +9,11 @@ use std::{
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-/// How the miner proves itself to the node. Either file is read again for
-/// every request, so a replaced token, or the new cookie a restarted node
-/// writes, applies at once.
+/// How the miner proves itself to the node. The file is read once, and
+/// again after the node answers 401 or 403, so a replaced token, or the new cookie
+/// a restarted node writes, applies from the next request (the bitcoin-cli
+/// way). A file that cannot be read fails the request: none goes out
+/// without the credentials asked for.
 #[derive(Debug, Clone)]
 pub enum Auth {
     None,
@@ -24,22 +26,24 @@ pub enum Auth {
 }
 
 impl Auth {
-    async fn header(&self) -> Option<String> {
+    async fn header(&self) -> Result<Option<String>, Error> {
         let (file, bearer) = match self {
-            Auth::None => return None,
+            Auth::None => return Ok(None),
             Auth::Cookie(file) => (file, false),
             Auth::Bearer(file) => (file, true),
         };
-        let content = tokio::fs::read_to_string(file).await.ok()?;
+        let content = tokio::fs::read_to_string(file)
+            .await
+            .map_err(|e| Error::Configuration(format!("{}: {e}", file.display())))?;
         let secret = content.trim();
         if secret.is_empty() {
-            return None;
+            return Err(Error::Configuration(format!("{} is empty", file.display())));
         }
-        Some(if bearer {
+        Ok(Some(if bearer {
             format!("Bearer {secret}")
         } else {
             format!("Basic {}", STANDARD.encode(secret))
-        })
+        }))
     }
 }
 
@@ -57,6 +61,8 @@ pub struct HttpNodeClient {
     base: url::Url,
     request: Arc<RwLock<serde_json::Value>>,
     auth: Auth,
+    /// The authorization header read from `auth`'s file, until a 401.
+    header: Arc<RwLock<Option<String>>>,
     client: reqwest::Client,
     timeout: Duration,
     maximum_bytes: usize,
@@ -101,6 +107,7 @@ impl HttpNodeClient {
             base,
             request: Arc::new(RwLock::new(request)),
             auth,
+            header: Arc::default(),
             client: reqwest::Client::builder()
                 .connect_timeout(timeout)
                 .redirect(reqwest::redirect::Policy::none())
@@ -135,10 +142,27 @@ impl HttpNodeClient {
             Some(body) => self.client.post(url).json(&body),
             None => self.client.get(url),
         };
-        if let Some(header) = self.auth.header().await {
+        let cached = self.header.read().unwrap().clone();
+        let header = match cached {
+            Some(header) => Some(header),
+            None => {
+                let read = self.auth.header().await?;
+                self.header.write().unwrap().clone_from(&read);
+                read
+            }
+        };
+        if let Some(header) = header {
             request = request.header(reqwest::header::AUTHORIZATION, header);
         }
-        Ok(request.send().await?)
+        let response = request.send().await?;
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            // A restarted node writes a new cookie: read it again.
+            *self.header.write().unwrap() = None;
+        }
+        Ok(response)
     }
 
     async fn request(

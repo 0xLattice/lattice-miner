@@ -3,15 +3,21 @@
 //! template as a job, the Stratum way. A pushed template digest leads to one
 //! template fetch, at most one in flight, while the workers keep hashing the
 //! job they have; the new job replaces it when the fetch returns. Every hit
-//! is submitted as soon as it arrives, old work included, as a Stratum pool
-//! takes shares: submissions run side by side and each answer is acted on as
-//! it comes, so hits on an old template never hold up the current one's, and
-//! a worker never waits to hand one over. Nothing here expires on a clock:
-//! only transport (a failed fetch, a crashed worker) waits before trying
-//! again.
+//! is submitted, old work included, as a Stratum pool takes shares: one at a
+//! time, in the order found, so a busy node is asked one thing at a time
+//! over one kept-alive connection; a hit whose submission fails in transit
+//! is sent again, never dropped. A worker never waits to hand one over. A hit
+//! moves its work's search on to the next harder target it does not clear,
+//! so the workers look only for what no hit has cleared yet. Nothing here
+//! expires on a clock: only transport (a failed fetch or submission, a
+//! crashed worker) waits before trying again.
 use crate::*;
-use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use futures_util::{FutureExt, future::BoxFuture};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     sync::{mpsc, watch},
     task::JoinSet,
@@ -49,8 +55,8 @@ pub trait StreamWorker: Send + Sync + 'static {
 pub struct SessionOptions {
     /// How often `GET /status` is asked while no event stream is connected.
     pub probe_interval: Duration,
-    /// The wait before a failed template fetch or a failed worker is tried
-    /// again.
+    /// The wait before a failed template fetch, a failed worker or a
+    /// submission that failed its retries is tried again.
     pub retry_wait: Duration,
     pub retry_delay: Duration,
     pub max_submit_retries: usize,
@@ -75,7 +81,8 @@ pub enum Event {
     FetchDue,
     /// A template fetch ended: `None` when the node has none (HTTP 409/503).
     Fetched(Result<Option<Arc<Work>>, Error>),
-    /// A hit's submission was answered (or failed after its retries).
+    /// A hit's submission was answered, or failed after its retries: the
+    /// hit is then sent again after the retry wait.
     Submitted {
         work_id: String,
         nonce: u64,
@@ -108,8 +115,11 @@ pub struct Session {
     fetched: Option<String>,
     due: bool,
     fetching: Pending<Result<Option<Work>, Error>>,
-    /// Every submission not yet answered.
-    submitting: FuturesUnordered<BoxFuture<'static, (StreamHit, Result<Submission, Error>)>>,
+    /// Every hit not yet answered, in the order found; the first is the one
+    /// being submitted.
+    queue: VecDeque<StreamHit>,
+    submitting: Pending<Result<Submission, Error>>,
+    resubmit_at: Option<Instant>,
     /// Per worker, the nonce after its last hit on the current work: where a
     /// worker started again resumes.
     resume: BTreeMap<usize, u64>,
@@ -144,7 +154,9 @@ impl Session {
             fetched: None,
             due: true,
             fetching: None,
-            submitting: FuturesUnordered::new(),
+            queue: VecDeque::new(),
+            submitting: None,
+            resubmit_at: None,
             resume: BTreeMap::new(),
             probing: None,
             next_probe: Instant::now(),
@@ -245,26 +257,67 @@ impl Session {
         }
     }
 
-    /// Submits `hit`, noting where its worker has searched to.
+    /// Queues `hit` for submission, noting where its worker has searched
+    /// to. A hit on the work searched moves the search on to the next harder
+    /// target the hit does not clear, or idles it when the hit clears them
+    /// all: the Stratum share-target rule, so another hit is a solution the
+    /// node has not been sent yet.
     fn found(&mut self, hit: StreamHit) {
-        if self
+        if let Some((work, target)) = self
             .current
-            .as_ref()
-            .is_some_and(|(work, _)| work.work_id == hit.work_id)
-            && let Some(worker) = allocate_ranges(u64::MAX, self.workers.len(), 0)
+            .clone()
+            .filter(|(work, _)| work.work_id == hit.work_id)
+        {
+            if let Some(worker) = allocate_ranges(u64::MAX, self.workers.len(), 0)
                 .iter()
                 .position(|range| range.contains(hit.nonce))
-        {
-            self.resume.insert(worker, hit.nonce.wrapping_add(1));
-        }
-        let (node, options) = (self.node.clone(), self.options.clone());
-        self.submitting.push(
-            async move {
-                let result = submit(&*node, &hit, &options).await;
-                (hit, result)
+            {
+                self.resume.insert(worker, hit.nonce.wrapping_add(1));
             }
-            .boxed(),
-        );
+            let hash = lattice_pow::hash(&work.prefix, hit.nonce);
+            let harder = work.targets.iter().copied().find(|t| *t < hash);
+            let next = harder.unwrap_or(IDLE).min(target);
+            if next < target {
+                self.search(work, next);
+            }
+        }
+        self.queue.push_back(hit);
+        self.submit_next();
+    }
+
+    /// Submits the first hit queued, unless a submission is in flight or
+    /// waiting to be sent again.
+    fn submit_next(&mut self) {
+        if self.submitting.is_some() || self.resubmit_at.is_some() {
+            return;
+        }
+        let Some(hit) = self.queue.front().cloned() else {
+            return;
+        };
+        let (node, options) = (self.node.clone(), self.options.clone());
+        self.submitting = Some(async move { submit(&*node, &hit, &options).await }.boxed());
+    }
+
+    /// The first hit queued was answered: it leaves the queue, and the next
+    /// is submitted. One that failed goes to the back, sent again after the
+    /// retry wait (the node answers a repeat as a duplicate): never dropped,
+    /// and a hit the node fails on every time holds up no other.
+    fn answered(&mut self, result: Result<Submission, Error>) -> Event {
+        let hit = self
+            .queue
+            .pop_front()
+            .expect("the hit submitted is first in the queue");
+        if result.is_err() {
+            self.resubmit_at = Some(Instant::now() + self.options.retry_wait);
+            self.queue.push_back(hit.clone());
+        }
+        self.submitted(&hit, &result);
+        self.submit_next();
+        Event::Submitted {
+            work_id: hit.work_id,
+            nonce: hit.nonce,
+            result,
+        }
     }
 
     fn pushed(&mut self, digest: String) {
@@ -287,7 +340,6 @@ impl Session {
                 return Event::FetchDue;
             }
             let polling = !self.connected() && self.probing.is_none();
-            let submitting = !self.submitting.is_empty();
             tokio::select! {
                 changed = changed(&mut self.digests) => {
                     match changed {
@@ -351,83 +403,81 @@ impl Session {
                     }
                 }
                 Some(hit) = self.hits.recv() => self.found(hit),
-                Some((hit, result)) = self.submitting.next(), if submitting => {
-                    self.submitted(&hit, &result);
-                    return Event::Submitted { work_id: hit.work_id, nonce: hit.nonce, result };
+                result = poll(&mut self.submitting) => return self.answered(result),
+                _ = until(self.resubmit_at) => {
+                    self.resubmit_at = None;
+                    self.submit_next();
                 }
             }
         }
     }
 
-    /// A child-only hit on the work searched moves its search on to the next
-    /// harder target; an accepted block idles it until the next template;
-    /// another refusal fetches one at once; a duplicate changes nothing.
+    /// An accepted block, or a refusal other than child-only or duplicate
+    /// of a hit on the work searched, idles that work and fetches a
+    /// template at once: the template decides what is searched next, from
+    /// its own target, so a refused hit's raise does not stand. (A hit
+    /// itself moves the search on: see [`Session::found`].)
     fn submitted(&mut self, hit: &StreamHit, result: &Result<Submission, Error>) {
         let Ok(submission) = result else { return };
         let current = self
             .current
             .clone()
             .filter(|(work, _)| work.work_id == hit.work_id);
+        let refused = !submission.accepted
+            && !matches!(submission.disposition.as_str(), "duplicate" | "childOnly");
         if submission.accepted {
             // The tip moved.
             self.due = true;
-            if let Some((work, _)) = current {
-                self.search(work, IDLE);
-            }
+        } else if refused && current.is_some() {
+            // The node will not take this work's hits.
+            self.due = true;
+        } else {
             return;
         }
-        let Some((work, target)) = current else {
-            return;
-        };
-        match submission.disposition.as_str() {
-            "duplicate" => {}
-            "childOnly" => {
-                let hash = lattice_pow::hash(&work.prefix, hit.nonce);
-                let harder = work.targets.iter().copied().find(|t| *t < hash);
-                let next = harder.unwrap_or(IDLE).min(target);
-                if next < target {
-                    self.search(work, next);
-                }
-            }
-            // The node will not take this work's hits: a template now.
-            _ => self.due = true,
+        // Idled already when the hit cleared every target.
+        if let Some((work, target)) = current
+            && target != IDLE
+        {
+            self.search(work, IDLE);
         }
     }
 
     /// Stops the workers and submits every hit they have found, those still
-    /// to come as they stop included. Returns what each submission answered.
-    /// Dropping it stops at once: the workers are killed, and submissions not
-    /// yet answered are abandoned.
-    pub async fn finish(mut self) -> Vec<Event> {
+    /// to come as they stop included, in order, handing `answered` each
+    /// answer as it comes. Submitting stops at the first that fails its
+    /// retries (the node is gone, say): what was not sent is returned.
+    /// Dropping it stops at once: the workers are killed, and hits not yet
+    /// answered are abandoned.
+    pub async fn finish(mut self, mut answered: impl FnMut(Event)) -> Vec<StreamHit> {
         // Their jobs closed, the workers stop after the chunk they are on.
         self.running.clear();
-        let mut answered = vec![];
-        loop {
-            let submitting = !self.submitting.is_empty();
+        let (mut stopped, mut failed) = (false, false);
+        while !stopped || !(failed || self.queue.is_empty()) {
             tokio::select! {
-                joined = self.tasks.join_next() => if joined.is_none() { break },
-                Some(hit) = self.hits.recv() => self.found(hit),
-                Some(answer) = self.submitting.next(), if submitting => answered.push(answer),
+                joined = self.tasks.join_next(), if !stopped => if joined.is_none() {
+                    stopped = true;
+                    while let Ok(hit) = self.hits.try_recv() {
+                        self.found(hit);
+                    }
+                },
+                Some(hit) = self.hits.recv(), if !stopped => self.found(hit),
+                result = poll(&mut self.submitting) => {
+                    // A failure leaves a resubmission waiting: nothing more is sent.
+                    failed |= result.is_err();
+                    answered(self.answered(result));
+                }
+                _ = until(self.resubmit_at), if !failed => {
+                    self.resubmit_at = None;
+                    self.submit_next();
+                }
             }
         }
-        while let Ok(hit) = self.hits.try_recv() {
-            self.found(hit);
-        }
-        while let Some(answer) = self.submitting.next().await {
-            answered.push(answer);
-        }
-        answered
-            .into_iter()
-            .map(|(hit, result)| Event::Submitted {
-                work_id: hit.work_id,
-                nonce: hit.nonce,
-                result,
-            })
-            .collect()
+        std::mem::take(&mut self.queue).into()
     }
 }
 
-/// A submission, retried while it fails in transit.
+/// A submission, retried while it fails in transit; a refused miner too, as
+/// the node client reads its cookie again after a 401.
 async fn submit(
     node: &dyn NodeClient,
     hit: &StreamHit,
@@ -436,9 +486,7 @@ async fn submit(
     let mut attempt = 0;
     loop {
         match node.submit(hit.work_id.clone(), hit.nonce).await {
-            Err(e)
-                if !matches!(e, Error::Unauthorized(_)) && attempt < options.max_submit_retries =>
-            {
+            Err(_) if attempt < options.max_submit_retries => {
                 attempt += 1;
                 tokio::time::sleep(options.retry_delay).await;
             }
