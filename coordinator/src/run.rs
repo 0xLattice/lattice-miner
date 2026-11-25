@@ -45,19 +45,21 @@ fn log_recipients(recipients: &Option<BTreeMap<String, String>>) {
     }
 }
 
-/// Says what a submission was answered; true for an accepted block.
+/// Says what a submission was answered; true for a block that became the
+/// tip (`canonicalized`), the only answer pacing holds for: a side block
+/// (`acceptedSide`, say on old work) leaves the current work as it was.
 fn log_submitted(work_id: &str, nonce: u64, result: &Result<Submission, Error>) -> bool {
     match result {
         Ok(Submission {
             accepted: true,
+            disposition,
             tip_cid,
-            ..
         }) => {
             log(format!(
                 "accepted tip={}",
                 tip_cid.as_deref().unwrap_or_default()
             ));
-            return true;
+            return disposition == "canonicalized";
         }
         // A child chain advanced; no parent block, so no pacing.
         Ok(submission) if submission.disposition == "childOnly" => {
