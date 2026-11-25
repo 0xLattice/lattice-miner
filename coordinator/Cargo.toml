@@ -25,7 +25,7 @@ num-bigint = "0.4"
 base64 = "0.22"
 futures-util = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "io-util", "fs", "signal", "sync", "net"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["rt", "codec"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 url = "2"
 clap = { version = "4", features = ["derive"] }

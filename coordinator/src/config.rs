@@ -12,7 +12,8 @@ pub struct MinerConfig {
     /// implementing lattice-node's docs/mining-workers.md.
     pub worker: Option<String>,
     pub workers: Option<usize>,
-    /// Nonces per round, across all workers.
+    /// Accepted and unused, for files written for the round-based miner:
+    /// workers search a job until the next one.
     pub batch_size: Option<u64>,
     /// Where each chain's block reward and fees go, by chain path. A chain
     /// left out mines to no one: its reward and fees burn. A chain named
@@ -23,24 +24,19 @@ pub struct MinerConfig {
     /// local search filter; blocks still commit their scheduled target.
     #[serde(default, deserialize_with = "unique_keys")]
     pub min_work: Option<BTreeMap<String, String>>,
-    /// Shortest gap between the starts of two rounds that produced parent
-    /// blocks. A floor, never a ceiling: a round that already ran longer
-    /// waits not at all.
+    /// Shortest gap between an accepted parent block and the template the
+    /// next one is mined on. A floor, never a ceiling.
     pub min_block_interval_seconds: Option<u64>,
     /// How long a request to the node may take, a template request
     /// including the node building it.
     pub template_timeout_seconds: Option<u64>,
-    /// Headroom on the round deadline, which catches only a hung round.
+    /// Accepted and unused, for files written for the round-based miner:
+    /// nothing expires on a clock.
     pub round_deadline_multiplier: Option<u64>,
 }
 
 pub const DEFAULT_WORKERS: usize = 1;
-pub const DEFAULT_BATCH_SIZE: u64 = 2_000_000_000;
 pub const DEFAULT_TEMPLATE_TIMEOUT_SECONDS: u64 = 60;
-pub const DEFAULT_ROUND_DEADLINE_MULTIPLIER: u64 = 10;
-/// The round deadline before any round has completed, and the most one
-/// measured round counts for.
-pub const FIRST_ROUND_ALLOWANCE: Duration = Duration::from_secs(600);
 
 impl MinerConfig {
     /// The settings `file` holds, checked. A key this release does not know
@@ -109,10 +105,6 @@ impl MinerConfig {
         self.workers.unwrap_or(DEFAULT_WORKERS)
     }
 
-    pub fn batch_size(&self) -> u64 {
-        self.batch_size.unwrap_or(DEFAULT_BATCH_SIZE)
-    }
-
     pub fn template_timeout(&self) -> Duration {
         Duration::from_secs(
             self.template_timeout_seconds
@@ -120,29 +112,11 @@ impl MinerConfig {
         )
     }
 
-    /// How long to hold the next round so that rounds producing parent
-    /// blocks start at least `minBlockIntervalSeconds` apart, given how long
-    /// the round that just produced one took. From the round's start,
-    /// because a block's timestamp is fixed when its template is built.
-    pub fn pacing_hold(&self, elapsed: Duration) -> Duration {
-        self.min_block_interval_seconds
-            .map(|s| Duration::from_secs(s).saturating_sub(elapsed))
-            .unwrap_or_default()
-    }
-
-    /// The deadline for the next round: the first-round allowance until a
-    /// round completes, then the longest completed round (counted at most
-    /// the allowance, so slow rounds cannot ratchet it) times the
-    /// multiplier, never less than the allowance. A hung round never
-    /// completes, so it never widens the bound that catches it.
-    pub fn round_deadline(&self, longest_completed: Duration) -> Duration {
-        let multiplier = self
-            .round_deadline_multiplier
-            .unwrap_or(DEFAULT_ROUND_DEADLINE_MULTIPLIER)
-            .max(1);
-        let measured = longest_completed.min(FIRST_ROUND_ALLOWANCE).as_secs();
-        Duration::from_secs(measured.saturating_mul(multiplier).min(u64::MAX / 4))
-            .max(FIRST_ROUND_ALLOWANCE)
+    /// How long to idle the workers after a parent block is accepted, so
+    /// that the next one (its timestamp fixed when its template is built) is
+    /// at least `minBlockIntervalSeconds` later.
+    pub fn pacing_hold(&self) -> Duration {
+        Duration::from_secs(self.min_block_interval_seconds.unwrap_or(0))
     }
 }
 

@@ -1,4 +1,6 @@
-pub use lattice_miner_core::{NonceRange, Target, WorkerOutput, allocate_ranges, parse_target};
+pub use lattice_miner_core::{
+    NonceRange, StreamHit, StreamJob, Target, WorkerOutput, allocate_ranges, parse_target,
+};
 use lattice_primitives::Block;
 use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
@@ -139,10 +141,4 @@ pub struct Submission {
     pub disposition: String,
     #[serde(rename = "tipCID", skip_serializing_if = "Option::is_none")]
     pub tip_cid: Option<String>,
-}
-#[derive(Debug, Clone)]
-pub struct WorkerResult {
-    pub worker_id: String,
-    pub work_id: String,
-    pub nonce: u64,
 }

@@ -1,9 +1,10 @@
-//! `lattice-miner run`: mining rounds against one node until stopped.
+//! `lattice-miner run`: mining against one node until stopped.
 //!
-//! A round is one coordinator batch: fetch a template carrying this round's
-//! recipients and minimum work, search it with the workers, submit what is
-//! found. `miner.json` is read again before every round; a file that no
-//! longer checks is reported and the settings read before are kept.
+//! One [`Session`] keeps the workers searching the node's current template
+//! and submits what they find. `miner.json` is read again before every
+//! template fetch, so the template carries its recipients and minimum work;
+//! a file that no longer checks is reported and the settings read before are
+//! kept.
 use crate::*;
 use std::{
     collections::BTreeMap,
@@ -13,7 +14,7 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-/// The wait before retrying a round that got no template, or failed.
+/// The wait before a failed template fetch or worker is tried again.
 pub const RETRY_WAIT: Duration = Duration::from_secs(5);
 
 /// A template body may carry many hosted levels' blocks.
@@ -44,22 +45,60 @@ fn log_recipients(recipients: &Option<BTreeMap<String, String>>) {
     }
 }
 
+/// Says what a submission was answered; true for a block that became the
+/// tip (`canonicalized`), the only answer pacing holds for: a side block
+/// (`acceptedSide`, say on old work) leaves the current work as it was.
+fn log_submitted(work_id: &str, nonce: u64, result: &Result<Submission, Error>) -> bool {
+    match result {
+        Ok(Submission {
+            accepted: true,
+            disposition,
+            tip_cid,
+        }) => {
+            log(format!(
+                "accepted tip={}",
+                tip_cid.as_deref().unwrap_or_default()
+            ));
+            return disposition == "canonicalized";
+        }
+        // A child chain advanced; no parent block, so no pacing.
+        Ok(submission) if submission.disposition == "childOnly" => {
+            log("accepted child block(s) (childOnly)")
+        }
+        Ok(submission) => log(format!(
+            "the node refused work {work_id} nonce {nonce} ({})",
+            submission.disposition
+        )),
+        Err(e @ Error::Unauthorized(_)) => log(format!(
+            "the node refused the miner ({e}); check the token or cookie"
+        )),
+        Err(e) => log(format!(
+            "submitting work {work_id} nonce {nonce} failed ({e})"
+        )),
+    }
+    false
+}
+
 /// The workers a configuration names.
-fn workers(config: &MinerConfig) -> Vec<Arc<dyn Worker>> {
+fn workers(config: &MinerConfig) -> Vec<Arc<dyn StreamWorker>> {
     (0..config.workers())
-        .map(|i| match config.worker.as_deref() {
+        .map(|_| match config.worker.as_deref() {
             Some(path) if path != "cpu" => {
-                Arc::new(ProcessWorker::new(format!("worker-{i}"), path.into())) as Arc<dyn Worker>
+                Arc::new(ProcessWorker::new(path.into())) as Arc<dyn StreamWorker>
             }
-            _ => Arc::new(CpuWorker::new(format!("cpu-{i}"))) as Arc<dyn Worker>,
+            _ => Arc::new(CpuWorker) as Arc<dyn StreamWorker>,
         })
         .collect()
 }
 
-/// Rounds until `cancel`. Fails only when the first read of the settings or
-/// the node URL does not check; after that every failure is logged and the
-/// next round retries.
-pub async fn run(options: RunOptions, cancel: CancellationToken) -> Result<(), String> {
+/// Mines until `cancel`, then submits every hit found unless `force` comes
+/// first. Fails only when the first read of the settings or the node URL
+/// does not check; after that every failure is logged and mining goes on.
+pub async fn run(
+    options: RunOptions,
+    cancel: CancellationToken,
+    force: CancellationToken,
+) -> Result<(), String> {
     let mut config = MinerConfig::load(&options.config)?;
     let client = |config: &MinerConfig| {
         HttpNodeClient::new(
@@ -71,7 +110,8 @@ pub async fn run(options: RunOptions, cancel: CancellationToken) -> Result<(), S
         )
         .map_err(|e| e.to_string())
     };
-    let digests = client(&config)?.digest_feed(cancel.child_token());
+    let mut node = client(&config)?;
+    let digests = node.digest_feed(cancel.child_token());
     log(format!(
         "mining through {}{}",
         options.node,
@@ -80,158 +120,126 @@ pub async fn run(options: RunOptions, cancel: CancellationToken) -> Result<(), S
             .map(|s| format!(", pacing parent blocks at least {s}s apart"))
             .unwrap_or_default()
     ));
-    // The coordinator is rebuilt only when what it is built from changes, so
-    // its nonce cursor carries across rounds on the same work.
-    let mut built: Option<(MinerConfig, HttpNodeClient, Coordinator)> = None;
-    let mut longest_completed = Duration::ZERO;
+    // The workers and the node client are replaced only when what they are
+    // built from changes; workers otherwise live for the whole run.
+    let mut built = config.clone();
+    let mut session = Session::new(
+        Arc::new(node.clone()),
+        workers(&config),
+        Some(digests),
+        SessionOptions {
+            retry_wait: RETRY_WAIT,
+            ..Default::default()
+        },
+    );
     let mut without_template_since: Option<Instant> = None;
     let mut logged_recipients = None;
     let mut warned_unpaid: Vec<String> = vec![];
-    while !cancel.is_cancelled() {
-        match MinerConfig::load(&options.config) {
-            Ok(read) => config = read,
-            Err(e) => log(format!("mining on with the settings read before: {e}")),
-        }
-        if logged_recipients.as_ref() != Some(&config.recipients) {
-            log_recipients(&config.recipients);
-            logged_recipients = Some(config.recipients.clone());
-        }
-        let stale = built.as_ref().is_none_or(|(was, _, _)| {
-            (
-                &was.worker,
-                was.workers(),
-                was.batch_size(),
-                was.template_timeout(),
-            ) != (
-                &config.worker,
-                config.workers(),
-                config.batch_size(),
-                config.template_timeout(),
-            )
-        });
-        if stale {
-            let node = match client(&config) {
-                Ok(node) => node,
-                Err(e) => {
-                    log(format!(
-                        "cannot reach the node with these settings ({e}); retrying"
-                    ));
-                    tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        _ = tokio::time::sleep(RETRY_WAIT) => continue,
+    loop {
+        let event = tokio::select! {
+            _ = cancel.cancelled() => break,
+            event = session.next() => event,
+        };
+        match event {
+            Event::FetchDue => {
+                // Settings are read again before every template.
+                match MinerConfig::load(&options.config) {
+                    Ok(read) => config = read,
+                    Err(e) => log(format!("mining on with the settings read before: {e}")),
+                }
+                if logged_recipients.as_ref() != Some(&config.recipients) {
+                    log_recipients(&config.recipients);
+                    logged_recipients = Some(config.recipients.clone());
+                }
+                if (&built.worker, built.workers(), built.template_timeout())
+                    != (&config.worker, config.workers(), config.template_timeout())
+                {
+                    match client(&config) {
+                        Ok(replaced) => {
+                            node = replaced;
+                            session.replace(Arc::new(node.clone()), workers(&config));
+                            built = config.clone();
+                        }
+                        Err(e) => log(format!(
+                            "cannot reach the node with these settings ({e}); mining on with the settings read before"
+                        )),
                     }
                 }
-            };
-            let coordinator = Coordinator::new(
-                Arc::new(node.clone()),
-                workers(&config),
-                CoordinatorOptions {
-                    total_batch_size: config.batch_size(),
-                    digests: Some(digests.clone()),
-                    ..Default::default()
-                },
-            );
-            built = Some((config.clone(), node, coordinator));
-        }
-        let (_, node, coordinator) = built.as_mut().expect("built above");
-        // Recipients apply from this round on, with no restart.
-        node.set_request(config.template_request().expect("checked when loaded"));
-        let deadline = config.round_deadline(longest_completed);
-        let started = Instant::now();
-        let cycle = tokio::select! {
-            cycle = coordinator.run_batch(&cancel) => cycle,
-            _ = tokio::time::sleep(deadline) => {
-                // Dropping the batch cancels its searches and stops worker
-                // processes. Loud by construction: only a hung round gets here.
-                log(format!(
-                    "ROUND DEADLINE EXCEEDED after {}s: the round was abandoned and its workers stopped. Raise roundDeadlineMultiplier in miner.json if rounds here legitimately run this long.",
-                    deadline.as_secs()
-                ));
-                continue;
+                // Recipients apply from this template on, with no restart.
+                node.set_request(config.template_request().expect("checked when loaded"));
+                session.fetch();
             }
-        };
-        let elapsed = started.elapsed();
-        let unpaid = node.unpaid_chains();
-        if unpaid != warned_unpaid {
-            if !unpaid.is_empty() {
-                log(format!(
-                    "WARNING: the node's template mines {} with no recipient in miner.json: their rewards and fees burn",
-                    unpaid.join(", ")
-                ));
-            }
-            warned_unpaid = unpaid;
-        }
-        if !matches!(cycle, Cycle::Backoff { .. }) {
-            without_template_since = None;
-        }
-        if matches!(
-            cycle,
-            Cycle::Submitted { .. } | Cycle::NoSolution { .. } | Cycle::Stale { .. }
-        ) {
-            longest_completed = longest_completed.max(elapsed);
-        }
-        let wait = match cycle {
-            Cycle::Cancelled => break,
-            Cycle::NoSolution { .. } | Cycle::Stale { .. } => Duration::ZERO,
-            Cycle::Submitted {
-                submission:
-                    Submission {
-                        accepted: true,
-                        tip_cid,
-                        ..
-                    },
-                ..
-            } => {
-                log(format!("accepted tip={}", tip_cid.unwrap_or_default()));
-                let hold = config.pacing_hold(elapsed);
-                if !hold.is_zero() {
-                    log(format!(
-                        "pacing: holding {}s so the next parent block is at least minBlockIntervalSeconds from this one",
-                        hold.as_secs()
-                    ));
+            Event::Fetched(fetched) => {
+                let unpaid = node.unpaid_chains();
+                if unpaid != warned_unpaid {
+                    if !unpaid.is_empty() {
+                        log(format!(
+                            "WARNING: the node's template mines {} with no recipient in miner.json: their rewards and fees burn",
+                            unpaid.join(", ")
+                        ));
+                    }
+                    warned_unpaid = unpaid;
                 }
-                hold
+                match fetched {
+                    Ok(Some(_)) => without_template_since = None,
+                    Err(e @ Error::Unauthorized(_)) => log(format!(
+                        "the node refused the miner ({e}); check the token or cookie; retrying"
+                    )),
+                    Ok(None) | Err(_) => {
+                        // A standstill, stated as what was observed: it retries
+                        // forever, and a passing-hiccup wording would hide that.
+                        let since = *without_template_since.get_or_insert_with(Instant::now);
+                        log(format!(
+                            "NOT MINING: no usable template from the node ({}). Stopped for {}s so far; check POST /mining/templates on this node.",
+                            fetched
+                                .err()
+                                .map(|e| e.to_string())
+                                .unwrap_or_else(|| "it has none yet: HTTP 409 or 503".into()),
+                            since.elapsed().as_secs()
+                        ));
+                    }
+                }
             }
-            Cycle::Submitted { submission, .. } if submission.disposition == "childOnly" => {
-                // A child chain advanced; no parent block, so no pacing.
-                log("accepted child block(s) (childOnly)");
-                Duration::ZERO
-            }
-            Cycle::Submitted { submission, .. } => {
-                log(format!(
-                    "the node refused this round's work ({}); retrying",
-                    submission.disposition
-                ));
-                RETRY_WAIT
-            }
-            Cycle::Backoff { error } => {
-                // A standstill, stated as what was observed: it retries
-                // forever, and a passing-hiccup wording would hide that.
-                let since = *without_template_since.get_or_insert(started);
-                log(format!(
-                    "NOT MINING: no usable template from the node ({}). Stopped for {}s so far; check POST /mining/templates on this node.",
-                    error.unwrap_or_else(|| "it has none yet: HTTP 409 or 503".into()),
-                    since.elapsed().as_secs()
-                ));
-                RETRY_WAIT
-            }
-            Cycle::NodeFailed { error } => {
-                log(format!(
-                    "the node refused the miner ({error}); check the token or cookie; retrying"
-                ));
-                RETRY_WAIT
-            }
-            Cycle::WorkerFailed {
-                worker_id, error, ..
+            Event::Submitted {
+                work_id,
+                nonce,
+                result,
             } => {
-                log(format!("worker {worker_id} failed ({error}); retrying"));
-                RETRY_WAIT
+                // Measured from the parent block's acceptance; a hold running
+                // already is not extended.
+                if log_submitted(&work_id, nonce, &result) && !session.paused() {
+                    let hold = config.pacing_hold();
+                    if !hold.is_zero() {
+                        log(format!(
+                            "pacing: holding {}s so the next parent block is at least minBlockIntervalSeconds from this one",
+                            hold.as_secs()
+                        ));
+                        session.pause(hold);
+                    }
+                }
             }
-        };
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            _ = tokio::time::sleep(wait) => {}
+            Event::WorkerFailed { worker, error } => {
+                log(format!("worker {worker} failed ({error}); retrying"))
+            }
         }
+    }
+    // A found block is not dropped on shutdown: the workers stop, and every
+    // hit they found is submitted first, unless asked again to stop.
+    log("stopping: submitting what the workers have found (signal again to stop now)");
+    tokio::select! {
+        events = session.finish() => {
+            for event in events {
+                if let Event::Submitted {
+                    work_id,
+                    nonce,
+                    result,
+                } = event
+                {
+                    log_submitted(&work_id, nonce, &result);
+                }
+            }
+        }
+        _ = force.cancelled() => log("stopped without waiting"),
     }
     log("mining stopped");
     Ok(())

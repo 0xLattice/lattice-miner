@@ -39,11 +39,15 @@ fn block() -> Block {
         nonce: 0,
     }
 }
-/// A node fixture: every template request is answered with `block` at the
-/// easiest target, every submission accepted. It records template request
-/// bodies and the heads of every request.
+/// A node fixture: every template request is answered with `block` at a
+/// target one hash in 1,024 meets, every submission accepted as
+/// `disposition`. It records template request bodies and the heads of every
+/// request. (At a target every hash meets, CPU workers find thousands of
+/// hits per template before its first answer idles them, all submitted, so
+/// stopping would wait on this fixture serving each one.)
 async fn node(
     block: Block,
+    disposition: &'static str,
 ) -> (
     String,
     Arc<Mutex<Vec<serde_json::Value>>>,
@@ -87,12 +91,12 @@ async fn node(
                     };
                     (
                         200,
-                        serde_json::json!({"workID":format!("work-{n}"),"block":block,"searchTarget":"0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","targets":["0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"],"chainPath":["Nexus"],"chains":[{"chainPath":["Nexus"],"rewardRecipient":"first"},{"chainPath":["Nexus","Kid"]}],"expiresInMilliseconds":30000,"templateDigest":format!("digest-{n}")}),
+                        serde_json::json!({"workID":format!("work-{n}"),"block":block,"searchTarget":"0x003fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","targets":["0x003fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"],"chainPath":["Nexus"],"chains":[{"chainPath":["Nexus"],"rewardRecipient":"first"},{"chainPath":["Nexus","Kid"]}],"expiresInMilliseconds":30000,"templateDigest":format!("digest-{n}")}),
                     )
                 } else if head.starts_with("POST /mining/work ") {
                     (
                         200,
-                        serde_json::json!({"accepted":true,"disposition":"accepted","tipCID":"fixture-tip"}),
+                        serde_json::json!({"accepted":true,"disposition":disposition,"tipCID":"fixture-tip"}),
                     )
                 } else if head.starts_with("GET /status ") {
                     let n = templates.lock().unwrap().len();
@@ -129,7 +133,7 @@ async fn until(what: &str, condition: impl Fn() -> bool) {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_rereads_settings_each_round_and_keeps_the_last_good() {
-    let (url, templates, heads) = node(block()).await;
+    let (url, templates, heads) = node(block(), "canonicalized").await;
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("miner.json");
     let token = dir.path().join("token");
@@ -251,4 +255,131 @@ fn check_answers_whether_run_would_accept_the_settings() {
     let output = check();
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("Nexus is named twice"));
+}
+
+/// A worker that will not stop holds up the first SIGTERM's orderly stop;
+/// a second stops the miner at once, and the worker with it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_second_signal_stops_at_once() {
+    use std::os::unix::fs::PermissionsExt;
+    let (url, templates, _) = node(block(), "canonicalized").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (worker, pidfile) = (dir.path().join("worker"), dir.path().join("pid"));
+    std::fs::write(
+        &worker,
+        format!(
+            "#!/bin/sh\necho $$ > {}\nexec sleep 1000\n",
+            pidfile.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let config = dir.path().join("miner.json");
+    std::fs::write(
+        &config,
+        serde_json::json!({"worker": worker, "recipients": {"Nexus": "first"}}).to_string(),
+    )
+    .unwrap();
+    let token = dir.path().join("token");
+    std::fs::write(&token, "secret").unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_lattice-miner"))
+        .args(["run", "--node", &url, "--token-file"])
+        .arg(&token)
+        .arg("--config")
+        .arg(&config)
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    until("a template", || !templates.lock().unwrap().is_empty()).await;
+    until("the worker", || {
+        std::fs::read_to_string(&pidfile).is_ok_and(|p| p.trim().parse::<i32>().is_ok())
+    })
+    .await;
+    let worker_pid: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let pid = nix::unistd::Pid::from_raw(child.id().unwrap() as i32);
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(child.try_wait().unwrap().is_none(), "stopped on the first");
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM).unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .expect("a second SIGTERM stops the miner")
+        .unwrap();
+    assert!(output.status.success());
+    let log = String::from_utf8_lossy(&output.stdout);
+    assert!(log.contains("stopped without waiting"), "{log}");
+    for _ in 0..200 {
+        let ps = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &worker_pid.to_string()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&ps.stdout);
+        if state.trim().is_empty() || state.trim().starts_with('Z') {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the worker outlived the miner");
+}
+
+/// Pacing holds after a block that became the tip, not after a side block.
+#[cfg(unix)]
+#[tokio::test]
+async fn only_a_new_tip_is_paced() {
+    for (disposition, paced) in [("acceptedSide", false), ("canonicalized", true)] {
+        let (url, templates, _) = node(block(), disposition).await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("miner.json");
+        std::fs::write(
+            &config,
+            r#"{"worker":"cpu","minBlockIntervalSeconds":600,"recipients":{"Nexus":"first"}}"#,
+        )
+        .unwrap();
+        let token = dir.path().join("token");
+        std::fs::write(&token, "secret").unwrap();
+        let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_lattice-miner"))
+            .args(["run", "--node", &url, "--token-file"])
+            .arg(&token)
+            .arg("--config")
+            .arg(&config)
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        if paced {
+            until("a template", || !templates.lock().unwrap().is_empty()).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            // Held: no template is fetched any more.
+            let held = templates.lock().unwrap().len();
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            assert_eq!(templates.lock().unwrap().len(), held);
+        } else {
+            // A side block idles the work it was on; the next template follows.
+            until("templates after side blocks", || {
+                templates.lock().unwrap().len() >= 5
+            })
+            .await;
+        }
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child.id().unwrap() as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        let log = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            log.contains("pacing: holding 600s"),
+            paced,
+            "{disposition}: {log}"
+        );
+    }
 }

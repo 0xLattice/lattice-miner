@@ -74,7 +74,15 @@ Remaining hardware coverage:
 - The inherited throughput figures in the README were not revalidated by this
   port or this correctness checkpoint.
 
-# The miner (coordinator and round loop)
+# The miner (coordinator)
+
+Since the streaming session (`coordinator/src/session.rs`), `lattice-miner
+run` no longer searches in rounds: each worker runs once for the whole run
+(`--stream`) and is handed the node's current template as a job. The round
+loop, its deadline and the one-shot worker adapter described below were
+removed with it, and so was the differential against the Swift coordinator's
+round transcripts (`swift-vectors.json`), which tested only them. What
+follows is the history of the port.
 
 `coordinator/` is `0xLattice/lattice-mining-rs@3ba1c5b` merged into this
 repository (that repository's content now lives here). It was a Rust port of
@@ -111,9 +119,8 @@ revisions `lattice-rs/platform-revisions.json` pins).
   `--once` child per round, so the probe that the node answers templates
   before a round is the round's own template request, and the coordinator
   (with its nonce cursor) lives across rounds while its settings do.
-- Shutdown (new): SIGINT/SIGTERM cancels the round, but a submission
-  already in flight is still answered, for at most 10 s (`SUBMIT_GRACE`), so
-  a found block is not dropped.
+- Shutdown (new): SIGINT/SIGTERM stops the workers, and every hit they found
+  is submitted first, so a found block is not dropped.
 - Recipients (new): the effective recipient map is logged at start and on
   every change, with a warning when it is empty or a fetched template mines a
   chain it does not name (that chain's reward and fees burn), once per
@@ -146,14 +153,10 @@ template reports why (the request's error, or HTTP 409/503).
 
 ## Evidence
 
-- Differential: `coordinator/tests/swift-vectors.json` is regenerated from the
-  actual, unchanged Swift `MinerLoopLogic.swift`, `ProofOfWork.swift` and
-  `MiningCoordinator.swift` at lattice-node `1486706`
-  (`coordinator/tools/swift-fixtures.py <lattice-node checkout>`; hashes in
-  `swift-evidence.json`). The Rust coordinator matches 72 range cases, 18
-  target/minimum-work parses and 13 cycle transcripts (assignments,
-  submissions, results, six metrics), the old expiry cycle now a slow search
-  that is not cut short.
+- Differential (retired with the round loop): the round coordinator matched
+  the actual Swift `MinerLoopLogic.swift`, `ProofOfWork.swift` and
+  `MiningCoordinator.swift` at lattice-node `1486706` on 72 range cases, 18
+  target/minimum-work parses and 13 cycle transcripts.
 - Native tests: event stream parsing (chunk boundaries, CRLF, keepalive
   comments), refusal and reconnect, bearer headers; a pushed digest ending a
   batch while a disconnect and a same-digest reconnect do not; `miner.json`

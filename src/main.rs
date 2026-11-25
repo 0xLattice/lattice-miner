@@ -3,7 +3,8 @@
 //! Implements the Mining Worker Protocol (see `lattice-node/docs/
 //! mining-workers.md`): search one immutable nonce range for a nonce
 //! such that `SHA256(prefix || nonce_be64) <= target`, and print one
-//! `WorkerResult` JSON object.
+//! `WorkerResult` JSON object. With `--stream` it instead follows jobs on
+//! stdin and prints every hit, setting the backend up once.
 //!
 //! Phase 1 is this pure-Rust CPU search — the **golden reference**. The Metal
 //! (and later CUDA) backends must reproduce it bit-for-bit; the CPU path stays
@@ -22,16 +23,17 @@ mod cuda_backend;
 mod opencl_backend;
 
 use clap::Parser;
-use lattice_miner_core::{parse_target, WorkerOutput};
+use lattice_miner_core::{parse_target, StreamHit, StreamJob, WorkerOutput};
 use sha2::{Digest, Sha256};
+use std::io::{BufRead, Write};
 
 /// Search one nonce range for a PoW solution.
 #[derive(Parser, Debug)]
 #[command(name = "lattice-miner-gpu", version, about)]
 struct Args {
     /// Opaque work identifier; echoed back in the result.
-    #[arg(long)]
-    work_id: String,
+    #[arg(long, required_unless_present = "stream")]
+    work_id: Option<String>,
 
     /// Nonce-independent PoW preimage prefix (hex). Preferred input.
     #[arg(long)]
@@ -44,16 +46,27 @@ struct Args {
     block_hex: Option<String>,
 
     /// PoW target as 256-bit big-endian hex. A nonce wins iff `digest <= target`.
-    #[arg(long)]
-    target: String,
+    #[arg(long, required_unless_present = "stream")]
+    target: Option<String>,
 
     /// First nonce in this assignment.
     #[arg(long, default_value_t = 0)]
     start_nonce: u64,
 
     /// Number of nonces to search: `[start_nonce, start_nonce + count)`.
-    #[arg(long)]
-    count: u64,
+    #[arg(long, required_unless_present = "stream")]
+    count: Option<u64>,
+
+    /// Stream mode: set the backend up once, then read one JSON job per line
+    /// on stdin (`{"workId","prefixHex","target","startNonce"}`) and print one
+    /// JSON line per winning nonce (`{"workId","nonce","hash"}`), lowest
+    /// first, searching on until stdin closes. A job with a new `workId`
+    /// starts a search at its `startNonce`; the same `workId` again changes
+    /// only the target and keeps the position. A job sent while searching
+    /// takes effect at the next hit or chunk of nonces. A target of zero,
+    /// which no hash meets, idles the worker where it is until the next job.
+    #[arg(long, conflicts_with_all = ["work_id", "prefix_hex", "block_hex", "target", "start_nonce", "count"])]
+    stream: bool,
 
     /// Search backend: `auto` (default: this build's GPU backend for the
     /// platform, Metal on macOS, otherwise OpenCL, otherwise CUDA), `metal`
@@ -75,6 +88,18 @@ fn automatic_backend() -> Option<&'static str> {
         Some("cuda")
     } else {
         None
+    }
+}
+
+/// The backend `--backend` names, `auto` resolved.
+fn chosen_backend(name: &str) -> &str {
+    match name {
+        // An empty value is a variable set to nothing, not a backend's name.
+        "auto" | "" => automatic_backend().unwrap_or_else(|| {
+            eprintln!("error: this build has no GPU backend for this platform (rebuild with --features opencl or cuda, or use --backend cpu)");
+            std::process::exit(2);
+        }),
+        named => named,
     }
 }
 
@@ -129,8 +154,151 @@ fn search_cpu(prefix: &[u8], target: &[u8; 32], start: u64, count: u64) -> Optio
     None
 }
 
+/// Nonces per chunk in stream mode: a job sent while searching takes effect
+/// at the next hit or the next chunk. A GPU chunk is one kernel launch.
+const GPU_CHUNK: u64 = 16_000_000;
+const CPU_CHUNK: u64 = 1 << 16;
+
+/// A job in stream mode: where its search is.
+struct Job {
+    work_id: String,
+    prefix: Vec<u8>,
+    target: [u8; 32],
+    nonce: u64,
+}
+
+fn fail(code: i32, message: &str) -> ! {
+    eprintln!("error: {message}");
+    std::process::exit(code);
+}
+
+/// Stream mode (see `Args::stream`). `search` is the backend, set up once:
+/// the first winning `(nonce, digest)` in `[start, start+count)`. Returns
+/// when stdin closes.
+fn stream(
+    chunk: u64,
+    search: impl FnMut(&[u8], &[u8; 32], u64, u64) -> Result<Option<(u64, [u8; 32])>, String>,
+) {
+    let (lines, jobs) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    serve(chunk, jobs, std::io::stdout().lock(), search);
+}
+
+/// Searches the jobs `jobs` brings, `chunk` nonces at a time, printing every
+/// hit to `stdout`, until `jobs` or `stdout` closes. After a hit the search
+/// goes on from the nonce after it.
+fn serve(
+    chunk: u64,
+    jobs: std::sync::mpsc::Receiver<String>,
+    mut stdout: impl Write,
+    mut search: impl FnMut(&[u8], &[u8; 32], u64, u64) -> Result<Option<(u64, [u8; 32])>, String>,
+) {
+    let mut job: Option<Job> = None;
+    loop {
+        // Every job sent since the last hit or chunk; with nothing to
+        // search, or a zero target that nothing meets, wait.
+        loop {
+            let line = match &job {
+                None => match jobs.recv() {
+                    Ok(line) => line,
+                    Err(_) => return,
+                },
+                Some(idle) if idle.target == [0; 32] => match jobs.recv() {
+                    Ok(line) => line,
+                    Err(_) => return,
+                },
+                Some(_) => match jobs.try_recv() {
+                    Ok(line) => line,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                },
+            };
+            let next: StreamJob = serde_json::from_str(&line)
+                .unwrap_or_else(|e| fail(2, &format!("invalid job line: {e}")));
+            let target = parse_target(&next.target)
+                .unwrap_or_else(|| fail(2, &format!("invalid target in job {}", next.work_id)));
+            match job.as_mut() {
+                Some(current) if current.work_id == next.work_id => current.target = target,
+                _ => {
+                    let hex = next
+                        .prefix_hex
+                        .strip_prefix("0x")
+                        .unwrap_or(&next.prefix_hex);
+                    let prefix = hex::decode(hex).unwrap_or_else(|_| {
+                        fail(2, &format!("invalid prefixHex in job {}", next.work_id))
+                    });
+                    job = Some(Job {
+                        work_id: next.work_id,
+                        prefix,
+                        target,
+                        nonce: next.start_nonce,
+                    });
+                }
+            }
+        }
+        let current = job.as_mut().expect("a job to search");
+        let found = search(&current.prefix, &current.target, current.nonce, chunk)
+            .unwrap_or_else(|e| fail(1, &format!("backend failed: {e}")));
+        let Some((nonce, digest)) = found else {
+            current.nonce = current.nonce.wrapping_add(chunk);
+            continue;
+        };
+        current.nonce = nonce.wrapping_add(1);
+        let hit = StreamHit {
+            work_id: current.work_id.clone(),
+            nonce,
+            hash: hex::encode(digest),
+        };
+        // A closed stdout is a coordinator that has gone.
+        if writeln!(stdout, "{}", serde_json::to_string(&hit).unwrap())
+            .and_then(|_| stdout.flush())
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
 fn main() {
     let args = Args::parse();
+
+    if args.stream {
+        match chosen_backend(&args.backend) {
+            "cpu" => stream(CPU_CHUNK, |p, t, s, c| Ok(search_cpu(p, t, s, c))),
+            #[cfg(target_os = "macos")]
+            "metal" => {
+                let mut searcher = metal_backend::Searcher::new()
+                    .unwrap_or_else(|e| fail(1, &format!("metal backend failed: {e}")));
+                stream(GPU_CHUNK, |p, t, s, c| searcher.search(p, t, s, c))
+            }
+            #[cfg(feature = "cuda")]
+            "cuda" => {
+                let mut searcher = cuda_backend::Searcher::new()
+                    .unwrap_or_else(|e| fail(1, &format!("cuda backend failed: {e}")));
+                stream(GPU_CHUNK, |p, t, s, c| searcher.search(p, t, s, c))
+            }
+            #[cfg(feature = "opencl")]
+            "opencl" => {
+                let mut searcher = opencl_backend::Searcher::new()
+                    .unwrap_or_else(|e| fail(1, &format!("opencl backend failed: {e}")));
+                stream(GPU_CHUNK, |p, t, s, c| searcher.search(p, t, s, c))
+            }
+            other => fail(
+                2,
+                &format!("backend '{other}' is unknown or not in this build (use auto|metal|cuda|opencl|cpu)"),
+            ),
+        }
+        return;
+    }
+    let work_id = args.work_id.expect("clap requires it without --stream");
+    let count = args.count.expect("clap requires it without --stream");
 
     let prefix = args
         .prefix_hex
@@ -142,28 +310,22 @@ fn main() {
             std::process::exit(2);
         });
 
-    let target = parse_target(&args.target).unwrap_or_else(|| {
-        eprintln!("error: invalid --target");
-        std::process::exit(2);
-    });
-
-    let backend = match args.backend.as_str() {
-        // An empty value is a variable set to nothing, not a backend's name.
-        "auto" | "" => automatic_backend().unwrap_or_else(|| {
-            eprintln!("error: this build has no GPU backend for this platform (rebuild with --features opencl or cuda, or use --backend cpu)");
+    let target = parse_target(&args.target.expect("clap requires it without --stream"))
+        .unwrap_or_else(|| {
+            eprintln!("error: invalid --target");
             std::process::exit(2);
-        }),
-        named => named,
-    };
+        });
+
+    let backend = chosen_backend(&args.backend);
 
     let found = match backend {
-        "cpu" => search_cpu(&prefix, &target, args.start_nonce, args.count),
+        "cpu" => search_cpu(&prefix, &target, args.start_nonce, count),
         "metal" => {
             #[cfg(target_os = "macos")]
             {
                 searched(
                     "metal",
-                    metal_backend::search_metal(&prefix, &target, args.start_nonce, args.count),
+                    metal_backend::search_metal(&prefix, &target, args.start_nonce, count),
                 )
             }
             #[cfg(not(target_os = "macos"))]
@@ -177,7 +339,7 @@ fn main() {
             {
                 searched(
                     "cuda",
-                    cuda_backend::search_cuda(&prefix, &target, args.start_nonce, args.count),
+                    cuda_backend::search_cuda(&prefix, &target, args.start_nonce, count),
                 )
             }
             #[cfg(not(feature = "cuda"))]
@@ -191,7 +353,7 @@ fn main() {
             {
                 searched(
                     "opencl",
-                    opencl_backend::search_opencl(&prefix, &target, args.start_nonce, args.count),
+                    opencl_backend::search_opencl(&prefix, &target, args.start_nonce, count),
                 )
             }
             #[cfg(not(feature = "opencl"))]
@@ -208,24 +370,70 @@ fn main() {
 
     let result = match found {
         Some((nonce, digest)) => WorkerOutput {
-            work_id: args.work_id,
+            work_id,
             status: "found".into(),
             nonce: Some(nonce),
             hash: Some(hex::encode(digest)),
             range_start: args.start_nonce,
-            range_count: args.count,
+            range_count: count,
         },
         None => WorkerOutput {
-            work_id: args.work_id,
+            work_id,
             status: "exhausted".into(),
             nonce: None,
             hash: None,
             range_start: args.start_nonce,
-            range_count: args.count,
+            range_count: count,
         },
     };
 
     println!("{}", serde_json::to_string(&result).unwrap());
+}
+
+#[cfg(test)]
+mod serve_tests {
+    use super::*;
+
+    /// Every nonce is searched once, in order: on from the nonce after each
+    /// hit, and from the end of a search that found nothing.
+    #[test]
+    fn searches_cover_the_nonces_without_gaps_or_overlaps() {
+        struct Lines(usize);
+        impl Write for Lines {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 += bytes.iter().filter(|b| **b == b'\n').count();
+                if self.0 > 20 {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (send, jobs) = std::sync::mpsc::channel();
+        send.send(r#"{"workId":"a","prefixHex":"00","target":"ff","startNonce":7}"#.into())
+            .unwrap();
+        // Hits every 250 nonces, searched 100 at a time.
+        let mut searches = vec![];
+        serve(100, jobs, Lines(0), |_, _, start, count| {
+            searches.push((start, count));
+            let hit = start.div_ceil(250) * 250;
+            Ok((hit < start + count).then_some((hit, [0; 32])))
+        });
+        assert_eq!(searches[0], (7, 100));
+        let mut expected = 7;
+        for (start, count) in searches {
+            assert_eq!(start, expected);
+            assert_eq!(count, 100);
+            let hit = start.div_ceil(250) * 250;
+            expected = if hit < start + count {
+                hit + 1
+            } else {
+                start + count
+            };
+        }
+    }
 }
 
 #[cfg(test)]

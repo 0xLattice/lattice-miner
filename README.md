@@ -6,7 +6,7 @@ mines lives here:
 
 | Crate | Binary | What it is |
 | --- | --- | --- |
-| [`coordinator/`](coordinator) | `lattice-miner` | The miner: a client of one node. It fetches templates, splits nonce ranges across workers, follows the node's template digest, submits what is found, and runs the rounds. |
+| [`coordinator/`](coordinator) | `lattice-miner` | The miner: a client of one node. It fetches templates, splits nonce ranges across workers, follows the node's template digest, submits every hit, and keeps each worker searching the current template. |
 | `.` (root) | `lattice-miner-gpu` | The worker: CPU, Metal, CUDA and OpenCL nonce search. |
 | [`core/`](core) | | The worker contract both sides share: target spelling, nonce ranges, the worker's result. |
 
@@ -49,45 +49,53 @@ Its settings are its own file, never the node's (default `miner.json`):
 ```
 
 - `worker`: `cpu` (the built-in search, the default) or the path of any
-  executable implementing the worker contract, such as `lattice-miner-gpu`. Its
-  backend is chosen by `LATTICE_MINER_BACKEND` in the miner's environment.
-- `workers` (default 1) and `batchSize` (nonces per round across all workers,
-  default 2,000,000,000).
+  executable implementing the worker contract with `--stream`, such as
+  `lattice-miner-gpu`. Its backend is chosen by `LATTICE_MINER_BACKEND` in the
+  miner's environment.
+- `workers` (default 1): worker processes, each started once and kept, each
+  searching its own share of the nonces. `batchSize` is accepted and unused.
 - `recipients`: where each chain's block reward and fees go, by chain path.
   Every template request carries them. A chain left out mines to no one: its
   reward and fees burn.
 - `minWork`: per chain, `2^N` or a decimal integer. A local search filter: the
   miner neither searches for nor submits hashes below it; blocks still commit
   their scheduled target.
-- `minBlockIntervalSeconds`: a floor on the spacing of rounds that produce a
-  parent block, measured from the round's start; a slower round waits not at
-  all.
+- `minBlockIntervalSeconds`: a floor on the spacing of parent blocks, measured
+  from a parent block's acceptance: after one the workers idle (their
+  processes kept) until it has passed, and another accepted meanwhile does
+  not extend the hold.
 - `templateTimeoutSeconds` (1 to 60, default 60): how long one request to the
   node may take, a template request including the node building it.
-- `roundDeadlineMultiplier` (default 10): the round deadline is 600 s until a
-  round completes, then the longest completed round (counted at most 600 s)
-  times this, never less than 600 s. It only catches a hung round; work never
-  expires on a clock.
+- `roundDeadlineMultiplier` is accepted and unused: nothing is searched in
+  rounds, and work never expires on a clock.
 
 An unknown key is refused (a misspelt `recipients` would burn every reward).
-The file is read again before every round: a changed recipient applies to the
-next round with no restart, and a file that no longer checks is logged while
-the last good settings are kept. Only a bad file at start is fatal.
+The file is read again before every template fetch: a changed recipient applies
+to the next template with no restart, and a file that no longer checks is
+logged while the last good settings are kept. Only a bad file at start is fatal.
 
-A round is one batch: fetch a template, search it, submit hits. A hit that
-clears only some of the template's targets (a child chain's, `childOnly`) is
-submitted and the search goes on over the same range toward the rest. Work is
-searched until the node's template digest changes: the miner follows
-`GET /mining/events` and stops a batch's search when a pushed digest differs
-from its work's. A nonce already found is always submitted, even after the tip
-moved: a block solved on an old tip is still a valid block whose work counts.
-A dropped stream says nothing about the chain: the search goes on,
-`GET /status` is polled every 2 s meanwhile, and the stream is opened again
-after a wait doubling from 250 ms to 5 s. A submission that fails in transit
-(no answer, HTTP 5xx) is retried up to 3 times. A round without a template, a
-refused submission or a failed worker is logged and retried after 5 s. SIGINT
-or SIGTERM ends the round in flight and exits; a submission already in flight
-gets up to 10 s to be answered first. The recipients in effect are logged at
+The workers run for the whole session (`--stream`), the Stratum way: the miner
+follows `GET /mining/events`, and each pushed template digest other than the
+one it has leads to one template fetch, never more than one at a time; when a
+fetch returns, it fetches again only if the newest pushed digest differs. The
+workers keep hashing the job they have while the fetch is in flight, and the
+new template becomes their next job. Every hit is submitted the moment it
+arrives, including hits on a template since replaced (a block solved on an old
+tip is still a valid block whose work counts); submissions run side by side, as
+a pool takes shares, and each answer is acted on as it comes, so old hits never
+hold up the current template's. A hit that clears only some of
+the template's targets (a child chain's, `childOnly`) moves the same work on
+to the next harder target, keeping its place in the nonces; an accepted block
+idles the workers until the next template; a `duplicate` changes nothing; any
+other refusal fetches a template at once. A worker started again after a
+failure resumes after its last hit. A dropped stream says
+nothing about the chain: the search goes on, `GET /status` is polled every
+2 s meanwhile, and the stream is opened again after a wait doubling from
+250 ms to 5 s. A submission that fails in transit (no answer, HTTP 5xx) is
+retried up to 3 times. A failed template fetch or a failed worker is logged
+and retried after 5 s. SIGINT or SIGTERM stops the miner: the workers stop
+after the chunk they are on, and every hit they found is submitted first; a
+second signal stops it at once. The recipients in effect are logged at
 start and whenever they change, with a warning when none are named or a
 template mines a chain with none. `lattice-miner check --config miner.json`
 exits 0 if `run` would accept the file and 2 with the reason if not.
@@ -108,6 +116,22 @@ SHA256( prefix || nonce_be64 )  ≤  target
 and prints one `WorkerResult` JSON object. A worker needs only SHA-256 and the
 protocol — no Lattice/block-parsing code. See
 `lattice-node/docs/mining-workers.md` for the normative contract.
+
+With `--stream` the worker instead sets its backend up once (CUDA initialised,
+kernel compiled) and keeps searching until stdin closes. It reads one JSON job
+per line on stdin and prints one JSON line per winning nonce, lowest first:
+
+```
+→ {"workId":"w1","prefixHex":"…","target":"00000fff…","startNonce":0}
+← {"workId":"w1","nonce":123456789,"hash":"00000a…"}
+```
+
+A job with a new `workId` starts a search at its `startNonce`; the same
+`workId` again changes only the target, and the search goes on from where it
+is. A job sent while searching takes effect at the next hit or the next chunk
+of nonces (16 M on a GPU, one kernel launch), whichever comes first. A target
+of zero, which no hash meets, idles the worker where it is until the next job.
+Every backend supports it.
 
 ## Status
 
