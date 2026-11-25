@@ -39,9 +39,12 @@ fn block() -> Block {
         nonce: 0,
     }
 }
-/// A node fixture: every template request is answered with `block` at the
-/// easiest target, every submission accepted as `disposition`. It records
-/// template request bodies and the heads of every request.
+/// A node fixture: every template request is answered with `block` at a
+/// target one hash in 1,024 meets, every submission accepted as
+/// `disposition`. It records template request bodies and the heads of every
+/// request. (At a target every hash meets, CPU workers find thousands of
+/// hits per template before its first answer idles them, all submitted, so
+/// stopping would wait on this fixture serving each one.)
 async fn node(
     block: Block,
     disposition: &'static str,
@@ -88,7 +91,7 @@ async fn node(
                     };
                     (
                         200,
-                        serde_json::json!({"workID":format!("work-{n}"),"block":block,"searchTarget":"0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","targets":["0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"],"chainPath":["Nexus"],"chains":[{"chainPath":["Nexus"],"rewardRecipient":"first"},{"chainPath":["Nexus","Kid"]}],"expiresInMilliseconds":30000,"templateDigest":format!("digest-{n}")}),
+                        serde_json::json!({"workID":format!("work-{n}"),"block":block,"searchTarget":"0x003fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","targets":["0x003fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"],"chainPath":["Nexus"],"chains":[{"chainPath":["Nexus"],"rewardRecipient":"first"},{"chainPath":["Nexus","Kid"]}],"expiresInMilliseconds":30000,"templateDigest":format!("digest-{n}")}),
                     )
                 } else if head.starts_with("POST /mining/work ") {
                     (

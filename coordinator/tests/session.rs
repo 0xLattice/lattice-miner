@@ -736,6 +736,32 @@ async fn hits_on_an_old_template_do_not_hold_up_the_current_ones() {
     assert!(node.old_in_flight.load(Ordering::SeqCst) > 0);
 }
 
+/// Many hits found and not yet submitted when mining stops go out side by
+/// side: stopping takes about one answer's time, not one per hit.
+#[tokio::test]
+async fn finishing_with_many_hits_found_is_prompt() {
+    let node = Node::new(vec![work("w1", "d1")]);
+    let workers = Arc::new(Workers::default());
+    let (mut session, _pushes) = session(&node, &workers, 1);
+    node.gate.add_permits(1);
+    next(&mut session).await;
+    assert_eq!(fetched(next(&mut session).await), "w1");
+    let found: Vec<(&str, u64)> = (0..10_000).map(|n| ("w1", n)).collect();
+    hits(&workers, 0, &found);
+    let started = tokio::time::Instant::now();
+    let events = tokio::time::timeout(Duration::from_secs(5), session.finish())
+        .await
+        .expect("finished");
+    // Each answer takes 10 ms; one after another would take 100 s.
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(events.len(), 10_000);
+    assert_eq!(node.submits().len(), 10_000);
+}
+
 /// Answers that come back out of order: a slow child-only answer at an easier
 /// target does not lower the target a faster one raised, and a block
 /// accepted on old work does not idle the current one.
