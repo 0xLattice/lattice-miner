@@ -735,3 +735,205 @@ async fn hits_on_an_old_template_do_not_hold_up_the_current_ones() {
     assert!(fetched_at.elapsed() < Duration::from_secs(1));
     assert!(node.old_in_flight.load(Ordering::SeqCst) > 0);
 }
+
+/// Answers that come back out of order: a slow child-only answer at an easier
+/// target does not lower the target a faster one raised, and a block
+/// accepted on old work does not idle the current one.
+mod out_of_order {
+    use futures_util::{FutureExt, future::BoxFuture};
+    use lattice_miner::*;
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+    use tokio::sync::{mpsc, watch};
+
+    fn t(b0: u8) -> Target {
+        let mut t = [0xff; 32];
+        t[0] = b0;
+        t
+    }
+    const IDLE: Target = [0; 32];
+
+    struct Node {
+        works: Mutex<Vec<Work>>,
+        answers: Mutex<HashMap<u64, (&'static str, u64)>>,
+        inflight: AtomicUsize,
+        most: AtomicUsize,
+    }
+    impl NodeClient for Node {
+        fn fetch_work(&self) -> BoxFuture<'_, Result<Option<Work>, Error>> {
+            async {
+                let mut w = self.works.lock().unwrap();
+                Ok(if w.is_empty() {
+                    None
+                } else {
+                    Some(w.remove(0))
+                })
+            }
+            .boxed()
+        }
+        fn stale_token(&self) -> BoxFuture<'_, Result<Option<String>, Error>> {
+            async { Ok(None) }.boxed()
+        }
+        fn submit(&self, _id: String, nonce: u64) -> BoxFuture<'_, Result<Submission, Error>> {
+            async move {
+                let n = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.most.fetch_max(n, Ordering::SeqCst);
+                let (a, ms) = self
+                    .answers
+                    .lock()
+                    .unwrap()
+                    .get(&nonce)
+                    .copied()
+                    .unwrap_or(("duplicate", 300));
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                self.inflight.fetch_sub(1, Ordering::SeqCst);
+                Ok(Submission {
+                    accepted: a == "accepted",
+                    disposition: a.into(),
+                    tip_cid: None,
+                })
+            }
+            .boxed()
+        }
+    }
+    #[derive(Default)]
+    struct W {
+        jobs: Mutex<Vec<(String, Target)>>,
+        hits: Mutex<Option<mpsc::UnboundedSender<StreamHit>>>,
+    }
+    struct Fake(Arc<W>);
+    impl StreamWorker for Fake {
+        fn stream(
+            &self,
+            mut jobs: mpsc::UnboundedReceiver<Job>,
+            hits: mpsc::UnboundedSender<StreamHit>,
+        ) -> BoxFuture<'static, Result<(), Error>> {
+            let s = self.0.clone();
+            *s.hits.lock().unwrap() = Some(hits);
+            async move {
+                while let Some(j) = jobs.recv().await {
+                    s.jobs
+                        .lock()
+                        .unwrap()
+                        .push((j.work.work_id.clone(), j.target));
+                }
+                Ok(())
+            }
+            .boxed()
+        }
+    }
+    fn work(id: &str, d: &str) -> Work {
+        Work {
+            work_id: id.into(),
+            block_hex: "00".into(),
+            prefix: format!("p-{id}").into_bytes(),
+            target: t(0x7f),
+            targets: vec![t(0x7f), t(0x3f), t(0x0f)],
+            stale_token: d.into(),
+        }
+    }
+    fn nonce(id: &str, above: Target, at_most: Target) -> u64 {
+        let p = format!("p-{id}").into_bytes();
+        (0..)
+            .find(|&n| {
+                let h = lattice_pow::hash(&p, n);
+                h > above && h <= at_most
+            })
+            .unwrap()
+    }
+    async fn drive(s: &mut Session, ms: u64) {
+        let _ = tokio::time::timeout(Duration::from_millis(ms), async {
+            loop {
+                if let Event::FetchDue = s.next().await {
+                    s.fetch();
+                }
+            }
+        })
+        .await;
+    }
+    fn hit(w: &W, id: &str, n: u64) {
+        w.hits
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .send(StreamHit {
+                work_id: id.into(),
+                nonce: n,
+                hash: String::new(),
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_child_only_does_not_lower_target_and_old_accept_does_not_idle() {
+        let node = Arc::new(Node {
+            works: Mutex::new(vec![work("a", "d1"), work("b", "d2")]),
+            answers: Default::default(),
+            inflight: 0.into(),
+            most: 0.into(),
+        });
+        let w = Arc::new(W::default());
+        let (push, rx) = watch::channel(Some("d1".to_string()));
+        let mut s = Session::new(
+            node.clone(),
+            vec![Arc::new(Fake(w.clone())) as Arc<dyn StreamWorker>],
+            Some(rx),
+            SessionOptions {
+                retry_delay: Duration::ZERO,
+                ..Default::default()
+            },
+        );
+        drive(&mut s, 50).await;
+        let easyhit = nonce("a", t(0x3f), t(0x7f)); // clears 7f only
+        let midhit = nonce("a", t(0x0f), t(0x3f)); // clears 3f
+        node.answers
+            .lock()
+            .unwrap()
+            .insert(easyhit, ("childOnly", 200));
+        node.answers
+            .lock()
+            .unwrap()
+            .insert(midhit, ("childOnly", 10));
+        hit(&w, "a", easyhit);
+        hit(&w, "a", midhit);
+        drive(&mut s, 400).await;
+        let jobs = w.jobs.lock().unwrap().clone();
+        assert_eq!(jobs.last().unwrap(), &("a".to_string(), t(0x0f)));
+        assert!(!jobs.iter().any(|j| j.1 == t(0x3f)));
+        // old-work accepted arrives after current moved to b
+        let parent = nonce("a", IDLE, t(0x0f));
+        node.answers
+            .lock()
+            .unwrap()
+            .insert(parent, ("accepted", 200));
+        hit(&w, "a", parent);
+        drive(&mut s, 20).await;
+        push.send_replace(Some("d2".into()));
+        drive(&mut s, 400).await;
+        let jobs = w.jobs.lock().unwrap().clone();
+        assert_eq!(jobs.last().unwrap(), &("b".to_string(), t(0x7f)));
+        // childOnly for current after accepted on current: stays idle
+        let bparent = nonce("b", IDLE, t(0x0f));
+        let bchild = nonce("b", t(0x3f), t(0x7f));
+        node.answers
+            .lock()
+            .unwrap()
+            .insert(bparent, ("accepted", 10));
+        node.answers
+            .lock()
+            .unwrap()
+            .insert(bchild, ("childOnly", 200));
+        hit(&w, "b", bchild);
+        hit(&w, "b", bparent);
+        drive(&mut s, 400).await;
+        let jobs = w.jobs.lock().unwrap().clone();
+        assert_eq!(jobs.last().unwrap(), &("b".to_string(), IDLE));
+    }
+}
