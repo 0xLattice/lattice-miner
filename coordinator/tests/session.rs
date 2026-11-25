@@ -57,6 +57,8 @@ struct Node {
     most_in_flight: AtomicUsize,
     /// Submissions wait while this is set.
     hold_submits: std::sync::atomic::AtomicBool,
+    /// Submission attempts still to fail in transit.
+    failing_submits: AtomicUsize,
 }
 
 impl Node {
@@ -70,6 +72,7 @@ impl Node {
             in_flight: AtomicUsize::new(0),
             most_in_flight: AtomicUsize::new(0),
             hold_submits: Default::default(),
+            failing_submits: AtomicUsize::new(0),
         })
     }
     fn submits(&self) -> Vec<(String, u64)> {
@@ -94,6 +97,15 @@ impl NodeClient for Node {
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.most_in_flight.fetch_max(now, Ordering::SeqCst);
             self.submits.lock().unwrap().push((id, nonce));
+            if self
+                .failing_submits
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                return Err(Error::Timeout);
+            }
             // Answers go to submissions in the order they are made.
             let answer = self
                 .answers
@@ -292,7 +304,7 @@ async fn pushed_digests_lead_to_one_fetch_at_a_time_and_jobs_to_the_same_workers
 }
 
 #[tokio::test]
-async fn every_hit_is_submitted_at_once_old_work_included() {
+async fn every_hit_is_submitted_one_at_a_time_in_order_old_work_included() {
     let node = Node::new(vec![work("w1", "d1"), work("w2", "d2")]);
     let workers = Arc::new(Workers::default());
     let (mut session, pushes) = session(&node, &workers, 1);
@@ -316,17 +328,100 @@ async fn every_hit_is_submitted_at_once_old_work_included() {
         ("w1".to_string(), b),
         ("w2".to_string(), c),
     ];
-    answered.sort();
-    let mut submits = node.submits();
-    submits.sort();
     assert_eq!(answered, expected);
-    assert_eq!(submits, expected);
-    // Side by side, none waiting for another's answer.
-    assert_eq!(node.most_in_flight.load(Ordering::SeqCst), 3);
+    assert_eq!(node.submits(), expected);
+    // One at a time: a busy node is never asked side by side.
+    assert_eq!(node.most_in_flight.load(Ordering::SeqCst), 1);
+}
+
+/// A submission that fails in transit is sent again, first in line: no hit
+/// is lost, the order holds, and only one is ever in flight.
+#[tokio::test]
+async fn a_failed_submission_is_sent_again_before_the_next_hit() {
+    let node = Node::new(vec![work("w1", "d1")]);
+    let workers = Arc::new(Workers::default());
+    let (mut session, _pushes) = session(&node, &workers, 1);
+    node.gate.add_permits(1);
+    next(&mut session).await;
+    assert_eq!(fetched(next(&mut session).await), "w1");
+    // More failures than one submission's quick retries (3).
+    node.failing_submits.store(5, Ordering::SeqCst);
+    let found: Vec<u64> = (0..3).map(|i| nonce("w1", HARD, EASY, i)).collect();
+    hits(
+        &workers,
+        0,
+        &[("w1", found[0]), ("w1", found[1]), ("w1", found[2])],
+    );
+    let mut answered = vec![];
+    for _ in 0..4 {
+        match next(&mut session).await {
+            Event::Submitted { nonce, result, .. } => answered.push((nonce, result.is_ok())),
+            other => panic!("expected a submission, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        answered,
+        vec![
+            (found[0], false),
+            (found[0], true),
+            (found[1], true),
+            (found[2], true)
+        ]
+    );
+    let attempts: Vec<u64> = node.submits().into_iter().map(|(_, n)| n).collect();
+    assert_eq!(
+        attempts,
+        [vec![found[0]; 6], vec![found[1], found[2]]].concat()
+    );
+    assert_eq!(node.most_in_flight.load(Ordering::SeqCst), 1);
+}
+
+/// A burst of hits on one template, as a worker sends them before it takes
+/// the next job: each moves the search on to the next harder target the hit
+/// does not clear, and one that clears them all idles it.
+#[tokio::test]
+async fn each_hit_moves_the_search_to_the_next_target_it_does_not_clear() {
+    const MID: Target = {
+        let mut t = [0xff; 32];
+        t[0] = 0x3f;
+        t
+    };
+    let mut three = work("w1", "d1");
+    three.targets = vec![EASY, MID, HARD];
+    let node = Node::new(vec![three]);
+    let workers = Arc::new(Workers::default());
+    let (mut session, _pushes) = session(&node, &workers, 1);
+    node.gate.add_permits(1);
+    next(&mut session).await;
+    assert_eq!(fetched(next(&mut session).await), "w1");
+    let easy = nonce("w1", MID, EASY, 0);
+    let again = nonce("w1", MID, EASY, 1);
+    let hard = nonce("w1", [0; 32], HARD, 0);
+    hits(&workers, 0, &[("w1", easy), ("w1", again), ("w1", hard)]);
+    for _ in 0..3 {
+        submitted(next(&mut session).await);
+    }
+    assert_eq!(
+        jobs(&workers).await,
+        vec![
+            (0, "w1".into(), EASY, 0),
+            (0, "w1".into(), MID, 0),
+            (0, "w1".into(), [0; 32], 0),
+        ]
+    );
+    // Every hit found is still submitted, the one at a passed target too.
+    assert_eq!(
+        node.submits(),
+        vec![
+            ("w1".into(), easy),
+            ("w1".into(), again),
+            ("w1".into(), hard)
+        ]
+    );
 }
 
 #[tokio::test]
-async fn child_only_searches_the_same_work_harder_and_a_parent_block_ends_it() {
+async fn a_hit_searches_the_same_work_harder_and_a_parent_block_ends_it() {
     let node = Node::new(vec![work("w1", "d1")]);
     let workers = Arc::new(Workers::default());
     let (mut session, _pushes) = session(&node, &workers, 1);
@@ -412,7 +507,7 @@ async fn a_failed_worker_is_started_again_with_the_current_job() {
     assert_eq!(workers.started.load(Ordering::SeqCst), 2);
     assert_eq!(
         jobs(&workers).await,
-        vec![(0, "w1".into(), EASY, 0), (1, "w1".into(), EASY, found + 1)]
+        vec![(0, "w1".into(), EASY, 0), (1, "w1".into(), HARD, found + 1)]
     );
 }
 
@@ -492,9 +587,9 @@ for line in sys.stdin:
     node.gate.add_permits(2);
     next(&mut session).await;
     assert_eq!(fetched(next(&mut session).await), "w1");
-    // Every hit is being submitted, none answered yet.
+    // The first hit is being submitted, the others wait their turn.
     let _ = tokio::time::timeout(Duration::from_millis(500), session.next()).await;
-    assert_eq!(node.submits().len(), 3);
+    assert_eq!(node.submits().len(), 1);
     pushes.send_replace(Some("d2".into()));
     assert!(matches!(next(&mut session).await, Event::FetchDue));
     assert_eq!(fetched(next(&mut session).await), "w2");
@@ -512,7 +607,7 @@ for line in sys.stdin:
     })
     .await;
     assert!(reached.is_ok(), "the new job never reached the worker");
-    assert_eq!(node.submits().len(), 3);
+    assert_eq!(node.submits().len(), 1);
 }
 
 #[tokio::test]
@@ -533,12 +628,16 @@ async fn a_duplicate_changes_nothing_and_a_refusal_fetches_at_once() {
     quiet(&mut session).await;
     hits(&workers, 0, &[("w1", b)]);
     assert_eq!(submitted(next(&mut session).await).2, "invalid");
-    // Not a transport failure: a template at once, and the search goes on.
+    // Not a transport failure: a template at once, and the search goes on
+    // (at the target the first hit moved it to).
     let event = tokio::time::timeout(Duration::from_millis(20), session.next())
         .await
         .expect("a fetch due at once");
     assert!(matches!(event, Event::FetchDue));
-    assert_eq!(jobs(&workers).await, vec![(0, "w1".into(), EASY, 0)]);
+    assert_eq!(
+        jobs(&workers).await,
+        vec![(0, "w1".into(), EASY, 0), (0, "w1".into(), HARD, 0)]
+    );
 }
 
 #[tokio::test]
@@ -580,7 +679,7 @@ async fn finishing_submits_every_hit_already_found() {
         &[("w1", found[0]), ("w1", found[1]), ("w1", found[2])],
     );
     let _ = tokio::time::timeout(Duration::from_millis(200), session.next()).await;
-    assert_eq!(node.submits().len(), 3);
+    assert_eq!(node.submits().len(), 1);
     // One more, found as the worker stops.
     let last = nonce("w1", HARD, EASY, 3);
     workers.parting.lock().unwrap().push(StreamHit {
@@ -593,15 +692,12 @@ async fn finishing_submits_every_hit_already_found() {
         .await
         .expect("finished");
     assert_eq!(events.len(), 4);
-    let mut submits = node.submits();
-    submits.sort();
-    let mut expected: Vec<_> = found
+    let expected: Vec<_> = found
         .iter()
         .chain([&last])
         .map(|n| ("w1".to_string(), *n))
         .collect();
-    expected.sort();
-    assert_eq!(submits, expected);
+    assert_eq!(node.submits(), expected);
 }
 
 /// The in-process worker idles on a zero target and goes on from where it
@@ -644,32 +740,35 @@ async fn a_pause_is_not_extended_by_another() {
     assert!(held < Duration::from_millis(420), "held {held:?}");
 }
 
-/// The backlog: a real CPU worker at an easy target finds hits far faster
-/// than the node answers them. Hits on the old template are still being
-/// answered when the current template's first hit is: it is not queued
-/// behind them.
+/// The flood a GPU made against a busy node: a real CPU worker at an easy
+/// target, a node slow to answer. The search moves on with each hit, so the
+/// template yields about one hit per target, not one per easy-target hash,
+/// and they go to the node one at a time.
 #[tokio::test]
-async fn hits_on_an_old_template_do_not_hold_up_the_current_ones() {
+async fn a_slow_node_is_not_flooded_with_hits() {
     #[derive(Default)]
     struct Slow {
-        fetched: AtomicUsize,
-        old_in_flight: AtomicUsize,
+        submits: AtomicUsize,
+        in_flight: AtomicUsize,
+        most_in_flight: AtomicUsize,
     }
     impl NodeClient for Slow {
         fn fetch_work(&self) -> BoxFuture<'_, Result<Option<Work>, Error>> {
             async {
-                let n = self.fetched.fetch_add(1, Ordering::SeqCst);
-                let mut easy = [0xff; 32];
-                easy[0] = 0;
-                let mut hard = easy;
-                hard[1] = 0;
+                let target = |zeros: usize| {
+                    let mut t = [0xff; 32];
+                    t[..zeros].fill(0);
+                    t
+                };
+                // One hash in 256, 65,536 and 16,777,216: the last out of
+                // reach here, so the search ends at the second.
                 Ok(Some(Work {
-                    work_id: format!("w{n}"),
+                    work_id: "w0".into(),
                     block_hex: "00".into(),
-                    prefix: format!("prefix-w{n}").into_bytes(),
-                    target: easy,
-                    targets: vec![easy, hard],
-                    stale_token: format!("d{n}"),
+                    prefix: b"prefix-w0".to_vec(),
+                    target: target(1),
+                    targets: vec![target(1), target(2), target(3)],
+                    stale_token: "d0".into(),
                 }))
             }
             .boxed()
@@ -677,20 +776,16 @@ async fn hits_on_an_old_template_do_not_hold_up_the_current_ones() {
         fn stale_token(&self) -> BoxFuture<'_, Result<Option<String>, Error>> {
             async { Ok(None) }.boxed()
         }
-        fn submit(&self, id: String, _: u64) -> BoxFuture<'_, Result<Submission, Error>> {
+        fn submit(&self, _: String, _: u64) -> BoxFuture<'_, Result<Submission, Error>> {
             async move {
-                let old = id == "w0";
-                if old {
-                    self.old_in_flight.fetch_add(1, Ordering::SeqCst);
-                }
-                let rtt = if old { 300 } else { 10 };
-                tokio::time::sleep(Duration::from_millis(rtt)).await;
-                if old {
-                    self.old_in_flight.fetch_sub(1, Ordering::SeqCst);
-                }
+                self.submits.fetch_add(1, Ordering::SeqCst);
+                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.most_in_flight.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
                 Ok(Submission {
                     accepted: false,
-                    disposition: if old { "duplicate" } else { "childOnly" }.into(),
+                    disposition: "childOnly".into(),
                     tip_cid: None,
                 })
             }
@@ -698,7 +793,7 @@ async fn hits_on_an_old_template_do_not_hold_up_the_current_ones() {
         }
     }
     let node = Arc::new(Slow::default());
-    let (pushes, digests) = watch::channel(Some("d0".to_string()));
+    let (_pushes, digests) = watch::channel(Some("d0".to_string()));
     let mut session = Session::new(
         node.clone(),
         vec![Arc::new(CpuWorker) as Arc<dyn StreamWorker>],
@@ -707,64 +802,22 @@ async fn hits_on_an_old_template_do_not_hold_up_the_current_ones() {
     );
     next(&mut session).await;
     assert_eq!(fetched(next(&mut session).await), "w0");
-    // w0's hits pile up.
-    let _ = tokio::time::timeout(Duration::from_millis(200), async {
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             session.next().await;
         }
     })
     .await;
-    pushes.send_replace(Some("d1".into()));
-    assert!(matches!(next(&mut session).await, Event::FetchDue));
-    assert_eq!(fetched(next(&mut session).await), "w1");
-    let fetched_at = tokio::time::Instant::now();
-    let answered = tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            if let Event::Submitted { work_id, .. } = session.next().await
-                && work_id == "w1"
-            {
-                return;
-            }
-        }
-    })
-    .await;
-    assert!(
-        answered.is_ok(),
-        "no hit on the current template answered within 1 s"
-    );
-    assert!(fetched_at.elapsed() < Duration::from_secs(1));
-    assert!(node.old_in_flight.load(Ordering::SeqCst) > 0);
+    // Searched at one in 256 throughout, the two seconds would have found
+    // hundreds; a hit or two more than one per target is a worker sending
+    // the next before it took the job its last one moved.
+    let submits = node.submits.load(Ordering::SeqCst);
+    assert!((1..=8).contains(&submits), "{submits} submissions");
+    assert_eq!(node.most_in_flight.load(Ordering::SeqCst), 1);
 }
 
-/// Many hits found and not yet submitted when mining stops go out side by
-/// side: stopping takes about one answer's time, not one per hit.
-#[tokio::test]
-async fn finishing_with_many_hits_found_is_prompt() {
-    let node = Node::new(vec![work("w1", "d1")]);
-    let workers = Arc::new(Workers::default());
-    let (mut session, _pushes) = session(&node, &workers, 1);
-    node.gate.add_permits(1);
-    next(&mut session).await;
-    assert_eq!(fetched(next(&mut session).await), "w1");
-    let found: Vec<(&str, u64)> = (0..10_000).map(|n| ("w1", n)).collect();
-    hits(&workers, 0, &found);
-    let started = tokio::time::Instant::now();
-    let events = tokio::time::timeout(Duration::from_secs(5), session.finish())
-        .await
-        .expect("finished");
-    // Each answer takes 10 ms; one after another would take 100 s.
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "{:?}",
-        started.elapsed()
-    );
-    assert_eq!(events.len(), 10_000);
-    assert_eq!(node.submits().len(), 10_000);
-}
-
-/// Answers that come back out of order: a slow child-only answer at an easier
-/// target does not lower the target a faster one raised, and a block
-/// accepted on old work does not idle the current one.
+/// Answers that come slowly: the target a hit raised holds whatever its
+/// answer, and a block accepted on old work does not idle the current one.
 mod out_of_order {
     use futures_util::{FutureExt, future::BoxFuture};
     use lattice_miner::*;
@@ -931,8 +984,14 @@ mod out_of_order {
         hit(&w, "a", midhit);
         drive(&mut s, 400).await;
         let jobs = w.jobs.lock().unwrap().clone();
-        assert_eq!(jobs.last().unwrap(), &("a".to_string(), t(0x0f)));
-        assert!(!jobs.iter().any(|j| j.1 == t(0x3f)));
+        assert_eq!(
+            jobs,
+            vec![
+                ("a".to_string(), t(0x7f)),
+                ("a".to_string(), t(0x3f)),
+                ("a".to_string(), t(0x0f))
+            ]
+        );
         // old-work accepted arrives after current moved to b
         let parent = nonce("a", IDLE, t(0x0f));
         node.answers
@@ -961,5 +1020,6 @@ mod out_of_order {
         drive(&mut s, 400).await;
         let jobs = w.jobs.lock().unwrap().clone();
         assert_eq!(jobs.last().unwrap(), &("b".to_string(), IDLE));
+        assert_eq!(node.most.load(Ordering::SeqCst), 1);
     }
 }
