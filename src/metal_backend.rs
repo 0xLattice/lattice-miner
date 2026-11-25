@@ -6,8 +6,8 @@
 
 use crate::sha256::{self, Midstate};
 use metal::{
-    CompileOptions, ComputePipelineDescriptor, Device, MTLCommandBufferStatus, MTLResourceOptions,
-    MTLSize,
+    Buffer, CommandQueue, CompileOptions, ComputePipelineDescriptor, ComputePipelineState, Device,
+    MTLCommandBufferStatus, MTLResourceOptions, MTLSize,
 };
 use std::mem::size_of;
 
@@ -129,6 +129,61 @@ pub fn search_metal(
     if count == 0 {
         return Ok(None);
     }
+    Searcher::new()?.search(prefix, target, start, count)
+}
+
+/// The device with the kernel compiled into a pipeline, kept for every search
+/// a streaming worker makes: the kernel is compiled once.
+pub struct Searcher {
+    device: Device,
+    pipeline: ComputePipelineState,
+    queue: CommandQueue,
+    found_buf: Buffer,
+}
+
+impl Searcher {
+    pub fn new() -> Result<Self, String> {
+        let device = Device::system_default().ok_or("no Metal device")?;
+        let library = device
+            .new_library_with_source(KERNEL_SRC, &CompileOptions::new())
+            .map_err(|error| format!("kernel compile failed: {error}"))?;
+        let function = library
+            .get_function("search", None)
+            .map_err(|error| format!("kernel function missing: {error}"))?;
+        let desc = ComputePipelineDescriptor::new();
+        desc.set_compute_function(Some(&function));
+        let pipeline = device
+            .new_compute_pipeline_state(&desc)
+            .map_err(|error| format!("pipeline failed: {error}"))?;
+        let queue = device.new_command_queue();
+        let found_buf = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+        Ok(Self {
+            device,
+            pipeline,
+            queue,
+            found_buf,
+        })
+    }
+
+    /// The first winning `(nonce, digest)` in `[start, start+count)`, or `None`.
+    pub fn search(
+        &mut self,
+        prefix: &[u8],
+        target: &[u8; 32],
+        start: u64,
+        count: u64,
+    ) -> Result<Option<(u64, [u8; 32])>, String> {
+        search(self, prefix, target, start, count)
+    }
+}
+
+fn search(
+    searcher: &Searcher,
+    prefix: &[u8],
+    target: &[u8; 32],
+    start: u64,
+    count: u64,
+) -> Result<Option<(u64, [u8; 32])>, String> {
     let ms = sha256::midstate_for_prefix(prefix);
     let (region, num_blocks, nonce_off) = region_for(&ms);
     let region_words: Vec<u32> = region
@@ -146,19 +201,12 @@ pub fn search_metal(
         ]);
     }
 
-    let device = Device::system_default().ok_or("no Metal device")?;
-    let library = device
-        .new_library_with_source(KERNEL_SRC, &CompileOptions::new())
-        .map_err(|error| format!("kernel compile failed: {error}"))?;
-    let function = library
-        .get_function("search", None)
-        .map_err(|error| format!("kernel function missing: {error}"))?;
-    let desc = ComputePipelineDescriptor::new();
-    desc.set_compute_function(Some(&function));
-    let pipeline = device
-        .new_compute_pipeline_state(&desc)
-        .map_err(|error| format!("pipeline failed: {error}"))?;
-    let queue = device.new_command_queue();
+    let Searcher {
+        device,
+        pipeline,
+        queue,
+        found_buf,
+    } = searcher;
 
     let opt = MTLResourceOptions::StorageModeShared;
     let ms_buf = device.new_buffer_with_data(ms.state.as_ptr() as *const _, 32, opt);
@@ -167,7 +215,6 @@ pub fn search_metal(
         (region_words.len() * 4) as u64,
         opt,
     );
-    let found_buf = device.new_buffer(4, opt);
 
     let tg = pipeline.max_total_threads_per_threadgroup().min(256);
     let chunk: u64 = 16_000_000;
@@ -194,11 +241,11 @@ pub fn search_metal(
 
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_compute_pipeline_state(pipeline);
         enc.set_buffer(0, Some(&ms_buf), 0);
         enc.set_buffer(1, Some(&region_buf), 0);
         enc.set_buffer(2, Some(&params_buf), 0);
-        enc.set_buffer(3, Some(&found_buf), 0);
+        enc.set_buffer(3, Some(found_buf), 0);
         enc.dispatch_threads(MTLSize::new(n, 1, 1), MTLSize::new(tg, 1, 1));
         enc.end_encoding();
         cmd.commit();

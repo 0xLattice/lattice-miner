@@ -109,6 +109,21 @@ and prints one `WorkerResult` JSON object. A worker needs only SHA-256 and the
 protocol — no Lattice/block-parsing code. See
 `lattice-node/docs/mining-workers.md` for the normative contract.
 
+With `--stream` the worker instead sets its backend up once (CUDA initialised,
+kernel compiled) and keeps searching until stdin closes. It reads one JSON job
+per line on stdin and prints one JSON line per winning nonce, lowest first:
+
+```
+→ {"workId":"w1","prefixHex":"…","target":"00000fff…","startNonce":0}
+← {"workId":"w1","nonce":123456789,"hash":"00000a…"}
+```
+
+A job with a new `workId` starts a search at its `startNonce`; the same
+`workId` again changes only the target, and the search goes on from where it
+is. A job sent while searching takes effect at the next hit or the next chunk
+of nonces (16 M on a GPU, one kernel launch), whichever comes first. Every
+backend supports it.
+
 ## Status
 
 Built in phases, each gated on reproducing the previous one bit-for-bit:

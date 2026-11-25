@@ -1,7 +1,8 @@
 //! The contract between the coordinator and a worker (lattice-node
 //! `docs/mining-workers.md`): how a target is spelled, how a nonce range is
-//! split, and the one JSON object a worker prints. Both sides use these, so
-//! they cannot drift apart.
+//! split, the one JSON object a worker prints, and the lines a worker in
+//! `--stream` mode reads and prints. Both sides use these, so they cannot
+//! drift apart.
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
@@ -69,6 +70,28 @@ pub struct WorkerOutput {
     pub range_count: u64,
 }
 
+/// One line a worker in `--stream` mode reads on stdin. A new `work_id`
+/// starts a search at `start_nonce`; the same `work_id` again changes only
+/// the target, and the search goes on from where it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamJob {
+    pub work_id: String,
+    pub prefix_hex: String,
+    /// Spelled as [`parse_target`] reads it.
+    pub target: String,
+    pub start_nonce: u64,
+}
+
+/// One line a worker in `--stream` mode prints for each winning nonce.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamHit {
+    pub work_id: String,
+    pub nonce: u64,
+    pub hash: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +155,25 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&found).unwrap(),
             r#"{"workId":"w","status":"found","nonce":7,"hash":"00","rangeStart":0,"rangeCount":8}"#
+        );
+        let job = StreamJob {
+            work_id: "w".into(),
+            prefix_hex: "dead".into(),
+            target: "ff".into(),
+            start_nonce: 3,
+        };
+        assert_eq!(
+            serde_json::to_string(&job).unwrap(),
+            r#"{"workId":"w","prefixHex":"dead","target":"ff","startNonce":3}"#
+        );
+        let hit = StreamHit {
+            work_id: "w".into(),
+            nonce: 7,
+            hash: "00".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&hit).unwrap(),
+            r#"{"workId":"w","nonce":7,"hash":"00"}"#
         );
     }
 }

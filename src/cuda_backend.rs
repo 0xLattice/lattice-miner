@@ -10,8 +10,9 @@
 //! host re-verifies every hit. Feature-gated (`--features cuda`).
 
 use crate::sha256::{self, Midstate};
-use cudarc::driver::{CudaDevice, DeviceRepr, LaunchAsync, LaunchConfig};
+use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, DeviceRepr, LaunchAsync, LaunchConfig};
 use cudarc::nvrtc::compile_ptx;
+use std::sync::Arc;
 
 /// CUDA-C kernel (compiled by NVRTC at runtime). `count` guards threads launched
 /// beyond the requested range (grid is rounded up to the block size).
@@ -125,10 +126,44 @@ pub fn search_cuda(
     start: u64,
     count: u64,
 ) -> Result<Option<(u64, [u8; 32])>, String> {
-    run(prefix, target, start, count)
+    Searcher::new()?.search(prefix, target, start, count)
+}
+
+/// The device with the kernel compiled and loaded, kept for every search a
+/// streaming worker makes: CUDA is initialised and the kernel compiled once.
+pub struct Searcher {
+    dev: Arc<CudaDevice>,
+    func: CudaFunction,
+    found: CudaSlice<u32>,
+}
+
+impl Searcher {
+    pub fn new() -> Result<Self, String> {
+        let dev = CudaDevice::new(0).map_err(|e| format!("CudaDevice::new: {e}"))?;
+        let ptx = compile_ptx(KERNEL_SRC).map_err(|e| format!("nvrtc compile: {e}"))?;
+        dev.load_ptx(ptx, "pow", &["search"])
+            .map_err(|e| format!("load_ptx: {e}"))?;
+        let func = dev.get_func("pow", "search").ok_or("kernel fn not found")?;
+        let found = dev
+            .htod_copy(vec![u32::MAX])
+            .map_err(|e| format!("htod found: {e}"))?;
+        Ok(Self { dev, func, found })
+    }
+
+    /// The first winning `(nonce, digest)` in `[start, start+count)`, or `None`.
+    pub fn search(
+        &mut self,
+        prefix: &[u8],
+        target: &[u8; 32],
+        start: u64,
+        count: u64,
+    ) -> Result<Option<(u64, [u8; 32])>, String> {
+        run(self, prefix, target, start, count)
+    }
 }
 
 fn run(
+    searcher: &mut Searcher,
     prefix: &[u8],
     target: &[u8; 32],
     start: u64,
@@ -147,11 +182,7 @@ fn run(
         ]);
     }
 
-    let dev = CudaDevice::new(0).map_err(|e| format!("CudaDevice::new: {e}"))?;
-    let ptx = compile_ptx(KERNEL_SRC).map_err(|e| format!("nvrtc compile: {e}"))?;
-    dev.load_ptx(ptx, "pow", &["search"])
-        .map_err(|e| format!("load_ptx: {e}"))?;
-    let func = dev.get_func("pow", "search").ok_or("kernel fn not found")?;
+    let Searcher { dev, func, found } = searcher;
 
     let ms_dev = dev
         .htod_copy(ms.state.to_vec())
@@ -169,8 +200,7 @@ fn run(
     let mut remaining = count;
     while remaining > 0 {
         let n = remaining.min(chunk);
-        let found_dev = dev
-            .htod_copy(vec![u32::MAX])
+        dev.htod_sync_copy_into(&[u32::MAX], found)
             .map_err(|e| format!("htod found: {e}"))?;
         let grid = ((n + block as u64 - 1) / block as u64) as u32;
         let cfg = LaunchConfig {
@@ -190,13 +220,13 @@ fn run(
                         base,
                         n,
                         &tgt_dev,
-                        &found_dev,
+                        &*found,
                     ),
                 )
                 .map_err(|e| format!("launch: {e}"))?;
         }
         let gid = dev
-            .dtoh_sync_copy(&found_dev)
+            .dtoh_sync_copy(found)
             .map_err(|e| format!("dtoh found: {e}"))?[0];
         if gid != u32::MAX {
             let nonce = base.wrapping_add(gid as u64);
@@ -217,3 +247,37 @@ fn run(
 // primitive u32/u64 we pass, so no extra impls are needed.
 #[allow(dead_code)]
 fn _assert_devicerepr<T: DeviceRepr>() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The kernel against the CPU oracle through one `Searcher`, set up once
+    /// and reused as a streaming worker reuses it: `cargo test --features
+    /// cuda -- --ignored` on a machine with an NVIDIA GPU.
+    #[test]
+    #[ignore = "needs an NVIDIA GPU"]
+    fn one_searcher_finds_what_the_cpu_search_finds() {
+        let mut searcher = Searcher::new().expect("a CUDA device");
+        let mut target = [0xff_u8; 32];
+        target[..2].fill(0);
+        for length in [0, 1, 47, 48, 55, 56, 63, 64, 100, 119, 120, 200] {
+            let prefix: Vec<u8> = (0..length).map(|i| (i * 7 + 3) as u8).collect();
+            for (start, count) in [(0, 300_000), (u64::MAX - 5, 300_000), (1 << 40, 17)] {
+                assert_eq!(
+                    searcher.search(&prefix, &target, start, count),
+                    Ok(crate::search_cpu(&prefix, &target, start, count)),
+                    "prefix of {length} bytes, {count} nonces from {start}"
+                );
+            }
+        }
+        // Several launches, wrapping past the last nonce; then no winner.
+        target[..3].fill(0);
+        let (start, count) = (u64::MAX - 20_000_000, 40_000_000);
+        assert_eq!(
+            searcher.search(b"lattice", &target, start, count),
+            Ok(crate::search_cpu(b"lattice", &target, start, count))
+        );
+        assert_eq!(searcher.search(b"lattice", &[0; 32], 0, 100_000), Ok(None));
+    }
+}

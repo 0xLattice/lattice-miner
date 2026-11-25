@@ -127,7 +127,7 @@ pub fn search_opencl(
     start: u64,
     count: u64,
 ) -> Result<Option<(u64, [u8; 32])>, String> {
-    run(prefix, target, start, count)
+    Searcher::new()?.search(prefix, target, start, count)
 }
 
 /// The devices to search on: graphics chips, unless
@@ -141,25 +141,33 @@ fn device_type() -> cl_device_type {
     }
 }
 
-fn run(
-    prefix: &[u8],
-    target: &[u8; 32],
-    start: u64,
-    count: u64,
-) -> Result<Option<(u64, [u8; 32])>, String> {
-    let ms = sha256::midstate_for_prefix(prefix);
-    let (region_words, num_blocks, nonce_off) = region_words_for(&ms);
+/// The device with the kernel built, kept for every search a streaming
+/// worker makes: the kernel is built once.
+pub struct Searcher {
+    context: Context,
+    queue: CommandQueue,
+    kernel: Kernel,
+    found_buf: Buffer<cl_uint>,
+}
 
-    let mut tgt = [0u32; 8];
-    for i in 0..8 {
-        tgt[i] = u32::from_be_bytes([
-            target[4 * i],
-            target[4 * i + 1],
-            target[4 * i + 2],
-            target[4 * i + 3],
-        ]);
+impl Searcher {
+    pub fn new() -> Result<Self, String> {
+        open()
     }
 
+    /// The first winning `(nonce, digest)` in `[start, start+count)`, or `None`.
+    pub fn search(
+        &mut self,
+        prefix: &[u8],
+        target: &[u8; 32],
+        start: u64,
+        count: u64,
+    ) -> Result<Option<(u64, [u8; 32])>, String> {
+        run(self, prefix, target, start, count)
+    }
+}
+
+fn open() -> Result<Searcher, String> {
     let device_id = *get_all_devices(device_type())
         .map_err(|e| format!("get_all_devices: {e}"))?
         .first()
@@ -177,15 +185,52 @@ fn run(
     let program = Program::create_and_build_from_source(&context, KERNEL_SRC, "")
         .map_err(|e| format!("kernel build: {e}"))?;
     let kernel = Kernel::create(&program, "search").map_err(|e| format!("kernel: {e}"))?;
+    let found_buf = unsafe {
+        Buffer::<cl_uint>::create(&context, CL_MEM_READ_WRITE, 1, ptr::null_mut())
+            .map_err(|e| format!("found_buf: {e}"))?
+    };
+    Ok(Searcher {
+        context,
+        queue,
+        kernel,
+        found_buf,
+    })
+}
+
+fn run(
+    searcher: &mut Searcher,
+    prefix: &[u8],
+    target: &[u8; 32],
+    start: u64,
+    count: u64,
+) -> Result<Option<(u64, [u8; 32])>, String> {
+    let ms = sha256::midstate_for_prefix(prefix);
+    let (region_words, num_blocks, nonce_off) = region_words_for(&ms);
+
+    let mut tgt = [0u32; 8];
+    for i in 0..8 {
+        tgt[i] = u32::from_be_bytes([
+            target[4 * i],
+            target[4 * i + 1],
+            target[4 * i + 2],
+            target[4 * i + 3],
+        ]);
+    }
+    let Searcher {
+        context,
+        queue,
+        kernel,
+        found_buf,
+    } = searcher;
 
     // Immutable inputs.
     let mut ms_buf = unsafe {
-        Buffer::<cl_uint>::create(&context, CL_MEM_READ_ONLY, 8, ptr::null_mut())
+        Buffer::<cl_uint>::create(context, CL_MEM_READ_ONLY, 8, ptr::null_mut())
             .map_err(|e| format!("ms_buf: {e}"))?
     };
     let mut region_buf = unsafe {
         Buffer::<cl_uint>::create(
-            &context,
+            context,
             CL_MEM_READ_ONLY,
             region_words.len(),
             ptr::null_mut(),
@@ -193,12 +238,8 @@ fn run(
         .map_err(|e| format!("region_buf: {e}"))?
     };
     let mut tgt_buf = unsafe {
-        Buffer::<cl_uint>::create(&context, CL_MEM_READ_ONLY, 8, ptr::null_mut())
+        Buffer::<cl_uint>::create(context, CL_MEM_READ_ONLY, 8, ptr::null_mut())
             .map_err(|e| format!("tgt_buf: {e}"))?
-    };
-    let mut found_buf = unsafe {
-        Buffer::<cl_uint>::create(&context, CL_MEM_READ_WRITE, 1, ptr::null_mut())
-            .map_err(|e| format!("found_buf: {e}"))?
     };
     unsafe {
         queue
@@ -219,18 +260,18 @@ fn run(
         let n = remaining.min(chunk);
         unsafe {
             queue
-                .enqueue_write_buffer(&mut found_buf, CL_BLOCKING, 0, &[u32::MAX], &[])
+                .enqueue_write_buffer(found_buf, CL_BLOCKING, 0, &[u32::MAX], &[])
                 .map_err(|e| format!("reset found: {e}"))?;
-            ExecuteKernel::new(&kernel)
+            ExecuteKernel::new(kernel)
                 .set_arg(&ms_buf)
                 .set_arg(&region_buf)
                 .set_arg(&(num_blocks as cl_uint))
                 .set_arg(&(nonce_off as cl_uint))
                 .set_arg(&(base as cl_ulong))
                 .set_arg(&tgt_buf)
-                .set_arg(&found_buf)
+                .set_arg(&*found_buf)
                 .set_global_work_size(n as usize)
-                .enqueue_nd_range(&queue)
+                .enqueue_nd_range(queue)
                 .map_err(|e| format!("enqueue: {e}"))?;
             queue.finish().map_err(|e| format!("finish: {e}"))?;
         }
@@ -238,7 +279,7 @@ fn run(
         let mut gid = [u32::MAX];
         unsafe {
             queue
-                .enqueue_read_buffer(&found_buf, CL_BLOCKING, 0, &mut gid, &[])
+                .enqueue_read_buffer(found_buf, CL_BLOCKING, 0, &mut gid, &[])
                 .map_err(|e| format!("read found: {e}"))?;
         }
         if gid[0] != u32::MAX {
