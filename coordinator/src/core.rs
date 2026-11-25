@@ -1,4 +1,6 @@
-pub use lattice_miner_core::{NonceRange, Target, WorkerOutput, allocate_ranges, parse_target};
+pub use lattice_miner_core::{
+    NonceRange, StreamHit, StreamJob, Target, WorkerOutput, allocate_ranges, parse_target,
+};
 use lattice_primitives::Block;
 use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};

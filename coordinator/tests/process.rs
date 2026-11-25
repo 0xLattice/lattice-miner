@@ -155,3 +155,59 @@ async fn cancellation_kills_descendant_group() {
     }
     panic!("descendant survived cancellation");
 }
+
+/// `--stream`: the job line the worker reads, the hit it prints, and how it
+/// ends.
+async fn stream(code: &str, job: Job) -> (Vec<StreamHit>, Result<(), Error>) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("worker.py");
+    std::fs::write(&path, format!("import sys,json\n{code}\n")).unwrap();
+    let mut worker = ProcessWorker::new("p", "python3".into());
+    worker.arguments = vec![path.to_string_lossy().into_owned()];
+    let (jobs, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, mut hits) = tokio::sync::mpsc::channel(8);
+    let run = tokio::spawn(StreamWorker::stream(&worker, receiver, sender));
+    jobs.send(job).unwrap();
+    let mut seen = vec![];
+    if let Ok(Some(hit)) = tokio::time::timeout(Duration::from_secs(10), hits.recv()).await {
+        seen.push(hit);
+    }
+    drop(jobs);
+    let ended = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .unwrap()
+        .unwrap();
+    (seen, ended)
+}
+
+#[tokio::test]
+async fn a_stream_worker_reads_jobs_prints_hits_and_ends_with_stdin() {
+    let job = Job {
+        work: work(),
+        target: [15; 32],
+        start_nonce: 9,
+    };
+    let echo = r#"
+assert sys.argv[1:] == ['--stream'], sys.argv
+for line in sys.stdin:
+    job = json.loads(line)
+    assert job['prefixHex'] == '01', job
+    print(json.dumps({'workId': job['workId'], 'nonce': job['startNonce'], 'hash': job['target']}), flush=True)"#;
+    let (hits, ended) = stream(echo, job.clone()).await;
+    ended.unwrap();
+    assert_eq!(
+        hits,
+        vec![StreamHit {
+            work_id: "fixed".into(),
+            nonce: 9,
+            hash: "0f".repeat(32),
+        }]
+    );
+    let crash = "sys.stdin.readline()\nsys.stderr.write('boom')\nsys.exit(3)";
+    let (hits, ended) = stream(crash, job.clone()).await;
+    assert!(hits.is_empty());
+    assert!(ended.unwrap_err().to_string().contains("boom"));
+    // Ending on its own while it still has jobs is a failure too.
+    let (_, ended) = stream("sys.stdin.readline()", job).await;
+    assert!(ended.is_err());
+}
